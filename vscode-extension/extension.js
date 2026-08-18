@@ -20,7 +20,14 @@ function slug(value) {
 }
 
 function languageExtension(language) {
-  const normalized = String(language || '').toLowerCase().replace(/[\s.]/g, '');
+  const normalized = String(language || '').toLowerCase().replace(/[\s.()_-]/g, '');
+  if (/^c\+\+\d*$/.test(normalized)) return 'cpp';       // C++, C++17, C++20
+  if (/^python\d*$/.test(normalized)) return 'py';         // Python, Python3
+  if (/^java\d*$/.test(normalized)) return 'java';         // Java, Java 17
+  if (/^(go|golang)\d*$/.test(normalized)) return 'go';
+  if (/^(csharp|c#)\d*$/.test(normalized)) return 'cs';
+  if (/^javascript\d*$/.test(normalized)) return 'js';
+  if (/^typescript\d*$/.test(normalized)) return 'ts';
   return EXTENSIONS[normalized] || 'txt';
 }
 

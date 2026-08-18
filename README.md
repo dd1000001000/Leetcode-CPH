@@ -23,6 +23,8 @@ VS Code 设置中可修改：
 - `leetcodeCph.outputDirectory`：输出目录，默认 `leetcode`。
 - `leetcodeCph.openSolutionAfterCapture`：收到后自动打开解答文件，默认开启。
 
+网页中选中的语言会决定解答文件后缀，例如 `C++17` → `solution.cpp`、`Python3` → `solution.py`、`Java 17` → `solution.java`。未能识别的语言会保存为 `solution.txt`。
+
 ## 说明
 
 插件仅向本机 `127.0.0.1` 发数据。它优先读取 LeetCode 的 Monaco 编辑器模型；页面改版时会尝试 textarea、CodeMirror 和编辑器 DOM 作为回退方式。

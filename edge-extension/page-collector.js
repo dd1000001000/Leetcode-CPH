@@ -57,8 +57,32 @@
   }
 
   function language() {
-    const selected = text('[data-cy="lang-select"]') || text('[class*="lang"] button') || attr('select', 'value');
-    return clean(selected);
+    const knownLanguages = new Set([
+      'c++', 'java', 'python3', 'python', 'javascript', 'typescript', 'c#', 'c',
+      'go', 'kotlin', 'swift', 'rust', 'ruby', 'php', 'dart', 'scala', 'cangjie'
+    ]);
+    // LeetCode's current language picker is a Radix dialog trigger. Its direct
+    // text is the selected language (for example, the button in the page is
+    // `<button aria-haspopup="dialog">C++ ...</button>`).
+    const dialogLanguage = [...document.querySelectorAll('button[aria-haspopup="dialog"]')]
+      .map((button) => clean(button.innerText || ''))
+      .find((value) => knownLanguages.has(value.toLowerCase()));
+    if (dialogLanguage) return dialogLanguage;
+
+    const selectors = [
+      '[data-cy="lang-select"]',
+      '[data-cy="lang-select"] button',
+      '[data-cy="code-editor"] [aria-label*="language" i]',
+      '[data-cy="code-editor"] [class*="lang-select"]',
+      '[data-cy="code-editor"] [class*="language-select"]',
+      '[data-cy="code-editor"] select'
+    ];
+    for (const selector of selectors) {
+      const element = document.querySelector(selector);
+      const selected = element?.value || element?.getAttribute('data-value') || element?.innerText;
+      if (selected?.trim()) return clean(selected);
+    }
+    return '';
   }
 
   window.__LEETCODE_CPH_COLLECT__ = () => {
