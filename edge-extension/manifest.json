@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "LeetCode CPH Capture",
+  "version": "0.1.0",
+  "description": "Capture the current LeetCode problem and editor code into VS Code.",
+  "permissions": ["activeTab", "tabs", "scripting"],
+  "host_permissions": [
+    "https://leetcode.cn/*",
+    "https://leetcode.com/*",
+    "http://127.0.0.1:27121/*"
+  ],
+  "action": {
+    "default_title": "带走当前题目",
+    "default_popup": "popup.html"
+  }
+}

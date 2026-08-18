@@ -1,0 +1,25 @@
+{
+  "name": "leetcode-cph-receiver",
+  "displayName": "LeetCode CPH Receiver",
+  "description": "Receives a LeetCode problem and its current browser editor code from the companion Edge extension.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished", "onCommand:leetcodeCph.openOutputFolder"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "leetcodeCph.openOutputFolder", "title": "LeetCode CPH: Open Output Folder" },
+      { "command": "leetcodeCph.showStatus", "title": "LeetCode CPH: Show Receiver Status" }
+    ],
+    "configuration": {
+      "title": "LeetCode CPH Receiver",
+      "properties": {
+        "leetcodeCph.port": { "type": "number", "default": 27121, "minimum": 1024, "maximum": 65535, "description": "Local port used by the companion Edge extension." },
+        "leetcodeCph.outputDirectory": { "type": "string", "default": "leetcode", "description": "Folder, relative to the current workspace, where captured problems are stored." },
+        "leetcodeCph.openSolutionAfterCapture": { "type": "boolean", "default": true, "description": "Open the saved solution file after a capture arrives." }
+      }
+    }
+  }
+}
