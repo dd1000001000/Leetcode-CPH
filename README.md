@@ -7,7 +7,9 @@
 1. 在 Edge 打开 `edge://extensions`，启用“开发人员模式”，选择“加载解压缩的扩展”，并选择 [`edge-extension`](./edge-extension) 文件夹。
 2. 在 VS Code 中打开 [`vscode-extension`](./vscode-extension) 文件夹，按 `F5` 启动“扩展开发宿主”；或者使用 `vsce package` 打出 VSIX 后安装。
 3. 在这个扩展开发宿主窗口中打开你的刷题工作区。接收服务会自动监听 `http://127.0.0.1:27121`。
-4. 打开力扣题页并在编辑器中写代码，点击 Edge 工具栏的 **LeetCode CPH Capture**，选择“带走当前题目和代码”。
+4. 打开力扣题页并在编辑器中写代码，直接点击 Edge 工具栏的 **LeetCode CPH Capture** 图标。
+
+图标角标会反馈结果：`...` 表示正在保存，`OK` 表示完成，`!` 表示失败；将鼠标悬停在图标上可查看原因或保存目录。
 
 每题会写入工作区的 `leetcode/<题号-题名>/`：
 
@@ -19,7 +21,7 @@
 
 VS Code 设置中可修改：
 
-- `leetcodeCph.port`：本地端口，默认 `27121`（需同时修改 Edge 扩展的 `popup.js`）。
+- `leetcodeCph.port`：本地端口，默认 `27121`（需同时修改 Edge 扩展的 `background.js`）。
 - `leetcodeCph.outputDirectory`：输出目录，默认 `leetcode`。
 - `leetcodeCph.openSolutionAfterCapture`：收到后自动打开解答文件，默认开启。
 
