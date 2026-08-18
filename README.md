@@ -26,3 +26,7 @@ VS Code 设置中可修改：
 ## 说明
 
 插件仅向本机 `127.0.0.1` 发数据。它优先读取 LeetCode 的 Monaco 编辑器模型；页面改版时会尝试 textarea、CodeMirror 和编辑器 DOM 作为回退方式。
+
+## License
+
+[MIT](./LICENSE)
