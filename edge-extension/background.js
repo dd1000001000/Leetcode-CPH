@@ -1,4 +1,7 @@
 const RECEIVER_URL = 'http://127.0.0.1:27121/capture';
+const SOCKET_URL = 'ws://127.0.0.1:27121/ws';
+let receiverSocket;
+let reconnectTimer;
 
 async function setState(tabId, text, color, title) {
   await Promise.all([
@@ -6,6 +9,46 @@ async function setState(tabId, text, color, title) {
     chrome.action.setBadgeBackgroundColor({ tabId, color }),
     chrome.action.setTitle({ tabId, title })
   ]);
+}
+
+function sendSocket(message) {
+  if (receiverSocket?.readyState === WebSocket.OPEN) {
+    receiverSocket.send(JSON.stringify(message));
+    return true;
+  }
+  return false;
+}
+
+function connectReceiver() {
+  if (receiverSocket?.readyState === WebSocket.OPEN || receiverSocket?.readyState === WebSocket.CONNECTING) return;
+  clearTimeout(reconnectTimer);
+  try {
+    receiverSocket = new WebSocket(SOCKET_URL);
+    receiverSocket.addEventListener('open', () => sendSocket({ type: 'hello', client: 'edge-extension' }));
+    receiverSocket.addEventListener('message', async (event) => {
+      try {
+        await handleReceiverMessage(JSON.parse(event.data));
+      } catch (error) {
+        console.warn('LeetCode CPH receiver message failed:', error);
+      }
+    });
+    receiverSocket.addEventListener('close', () => {
+      receiverSocket = undefined;
+      reconnectTimer = setTimeout(connectReceiver, 5000);
+    });
+    receiverSocket.addEventListener('error', () => receiverSocket?.close());
+  } catch (_) {
+    reconnectTimer = setTimeout(connectReceiver, 5000);
+  }
+}
+
+function canonicalProblemUrl(value) {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
+  } catch (_) {
+    return '';
+  }
 }
 
 async function collect(tabId) {
@@ -31,6 +74,43 @@ async function collect(tabId) {
   return result.result.payload;
 }
 
+async function applyCodeToMatchingTab(message) {
+  const targetUrl = canonicalProblemUrl(message.source);
+  const tabs = await chrome.tabs.query({});
+  const matches = tabs
+    .filter((tab) => canonicalProblemUrl(tab.url) === targetUrl)
+    .sort((left, right) => (right.lastAccessed || 0) - (left.lastAccessed || 0));
+  if (!matches.length) throw new Error('未找到打开中的对应力扣题目页。');
+
+  // For duplicate tabs, only the most recently active one is changed.
+  const tab = matches[0];
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ['page-collector.js'],
+    world: 'MAIN'
+  });
+  const [applyResult] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: 'MAIN',
+    args: [message.code, message.language],
+    func: (code, language) => window.__LEETCODE_CPH_APPLY_CODE__?.(code, language)
+  });
+  if (!applyResult?.result?.ok) throw new Error(applyResult?.result?.error || '浏览器未能写入代码。');
+  await setState(tab.id, 'OK', '#137333', `已从 VS Code 同步：${message.title || '当前解答'}`);
+  return { tabId: tab.id, title: tab.title || '', language: applyResult.result.language, duplicates: matches.length - 1 };
+}
+
+async function handleReceiverMessage(message) {
+  if (message?.type === 'ping') return sendSocket({ type: 'pong' });
+  if (message?.type !== 'applyCode' || !message.requestId) return;
+  try {
+    const result = await applyCodeToMatchingTab(message);
+    sendSocket({ type: 'applyResult', requestId: message.requestId, ok: true, result });
+  } catch (error) {
+    sendSocket({ type: 'applyResult', requestId: message.requestId, ok: false, error: error.message || '同步失败。' });
+  }
+}
+
 chrome.action.onClicked.addListener(async (tab) => {
   const tabId = tab.id;
   try {
@@ -52,3 +132,14 @@ chrome.action.onClicked.addListener(async (tab) => {
     if (tabId) await setState(tabId, '!', '#b3261e', message);
   }
 });
+
+chrome.runtime.onStartup.addListener(connectReceiver);
+chrome.runtime.onInstalled.addListener(connectReceiver);
+chrome.alarms.create('leetcode-cph-receiver-heartbeat', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'leetcode-cph-receiver-heartbeat') {
+    connectReceiver();
+    sendSocket({ type: 'ping' });
+  }
+});
+connectReceiver();

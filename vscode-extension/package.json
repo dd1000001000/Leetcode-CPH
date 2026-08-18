@@ -2,16 +2,17 @@
   "name": "leetcode-cph-receiver",
   "displayName": "LeetCode CPH Receiver",
   "description": "Receives a LeetCode problem and its current browser editor code from the companion Edge extension.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "local",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
-  "activationEvents": ["onStartupFinished", "onCommand:leetcodeCph.openOutputFolder"],
+  "activationEvents": ["onStartupFinished", "onCommand:leetcodeCph.openOutputFolder", "onCommand:leetcodeCph.sendCurrentSolution"],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       { "command": "leetcodeCph.openOutputFolder", "title": "LeetCode CPH: Open Output Folder" },
-      { "command": "leetcodeCph.showStatus", "title": "LeetCode CPH: Show Receiver Status" }
+      { "command": "leetcodeCph.showStatus", "title": "LeetCode CPH: Show Receiver Status" },
+      { "command": "leetcodeCph.sendCurrentSolution", "title": "LeetCode CPH: Send Current Solution to Browser" }
     ],
     "configuration": {
       "title": "LeetCode CPH Receiver",

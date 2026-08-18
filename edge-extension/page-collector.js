@@ -38,14 +38,23 @@
     return matched ? matched[0] : '';
   }
 
-  function code() {
-    // LeetCode currently uses Monaco in many views. Its model contains the full,
-    // non-virtualised text; the DOM fallback supports older CodeMirror layouts.
+  function editorModel() {
     try {
       const models = window.monaco?.editor?.getModels?.() || [];
       const values = models.map((model) => model.getValue()).filter(Boolean);
-      if (values.length) return values.sort((a, b) => b.length - a.length)[0];
+      if (values.length) {
+        const longest = values.sort((a, b) => b.length - a.length)[0];
+        return models.find((model) => model.getValue() === longest) || null;
+      }
     } catch (_) { /* Fall through to DOM readers. */ }
+    return null;
+  }
+
+  function code() {
+    // LeetCode currently uses Monaco in many views. Its model contains the full,
+    // non-virtualised text; the DOM fallback supports older CodeMirror layouts.
+    const model = editorModel();
+    if (model) return model.getValue();
 
     const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea, textarea');
     if (textarea?.value?.trim()) return textarea.value;
@@ -84,6 +93,40 @@
     }
     return '';
   }
+
+  function languageKey(value) {
+    const normalized = String(value || '').toLowerCase().replace(/[\s.()_-]/g, '');
+    if (/^c\+\+\d*$/.test(normalized)) return 'cpp';
+    if (/^python\d*$/.test(normalized)) return 'python';
+    if (/^java\d*$/.test(normalized)) return 'java';
+    if (/^(go|golang)\d*$/.test(normalized)) return 'go';
+    if (/^(csharp|c#)\d*$/.test(normalized)) return 'csharp';
+    return normalized;
+  }
+
+  window.__LEETCODE_CPH_APPLY_CODE__ = (newCode, expectedLanguage) => {
+    if (typeof newCode !== 'string') return { ok: false, error: '接收到的代码不是文本。' };
+    const pageLanguage = language();
+    if (expectedLanguage && pageLanguage && languageKey(expectedLanguage) !== languageKey(pageLanguage)) {
+      return { ok: false, error: `浏览器当前语言为 ${pageLanguage}，本地代码语言为 ${expectedLanguage}；未写入。` };
+    }
+
+    const model = editorModel();
+    if (model) {
+      model.setValue(newCode);
+      return { ok: true, language: pageLanguage || expectedLanguage || 'unknown' };
+    }
+
+    const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea, textarea');
+    if (textarea) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter ? setter.call(textarea, newCode) : (textarea.value = newCode);
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, language: pageLanguage || expectedLanguage || 'unknown' };
+    }
+    return { ok: false, error: '未找到力扣代码编辑器。' };
+  };
 
   window.__LEETCODE_CPH_COLLECT__ = () => {
       const problemTitle = title();

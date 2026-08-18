@@ -17,6 +17,14 @@
 - `README.md`：题面和样例
 - `metadata.json`：原始抓取数据与来源链接
 
+## 从 VS Code 回传代码到浏览器
+
+1. 保持对应题目的 LeetCode 页面处于打开状态，并在网页中选择与本地代码相同的语言。
+2. 在 VS Code 打开该题目目录中的 `solution.*`，可以是未保存的编辑内容。
+3. 按 `Ctrl+Shift+P`，运行 **LeetCode CPH: Send Current Solution to Browser**。
+
+扩展会读取同目录 `metadata.json` 中的题目链接，只把代码写回对应题目。若同一题在多个 Edge 窗口/标签页中打开，只更新最近活动的一个；若浏览器语言与本地抓取语言不一致，扩展会拒绝同步，避免覆盖错误语言的编辑器。
+
 ## 设置
 
 VS Code 设置中可修改：
