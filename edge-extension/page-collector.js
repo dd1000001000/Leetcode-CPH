@@ -3,16 +3,23 @@
   const attr = (selector, name) => document.querySelector(selector)?.getAttribute(name) || '';
   const clean = (value) => value.replace(/\u00a0/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 
+  function questionLinkText() {
+    const link = [...document.querySelectorAll('a[href^="/problems/"]')]
+      .find((element) => /^\d+\s*[.、]/.test((element.innerText || '').trim()));
+    return clean(link?.innerText || '');
+  }
+
   function title() {
-    const heading = text('[data-cy="question-title"]') || text('h1');
+    const heading = questionLinkText() || text('[data-cy="question-title"]') || text('h1');
     const browserTitle = document.title.replace(/\s*-\s*LeetCode.*$/i, '').trim();
     return clean(heading || browserTitle || 'Untitled Problem');
   }
 
   function problemId(problemTitle) {
+    const fromQuestionLink = questionLinkText().match(/^(\d+)\s*[.、]/)?.[1];
     const fromPath = location.pathname.match(/problems\/([^/]+)/)?.[1];
     const fromTitle = problemTitle.match(/^(\d+)\s*[.、]/)?.[1];
-    return fromTitle || fromPath || '';
+    return fromQuestionLink || fromTitle || fromPath || '';
   }
 
   function description() {
