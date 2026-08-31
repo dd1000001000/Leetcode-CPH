@@ -51,6 +51,15 @@ function canonicalProblemUrl(value) {
   }
 }
 
+function problemSlug(value) {
+  try {
+    const match = new URL(value).pathname.match(/\/problems\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]).toLowerCase() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 async function collect(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -76,10 +85,37 @@ async function collect(tabId) {
 
 async function applyCodeToMatchingTab(message) {
   const targetUrl = canonicalProblemUrl(message.source);
+  const targetSlug = problemSlug(message.source);
   const tabs = await chrome.tabs.query({});
-  const matches = tabs
-    .filter((tab) => canonicalProblemUrl(tab.url) === targetUrl)
-    .sort((left, right) => (right.lastAccessed || 0) - (left.lastAccessed || 0));
+  // Only LeetCode problem tabs are candidates. `tab.url` can be missing for
+  // some tab states (for example a pending navigation), so fall back to
+  // `tab.pendingUrl`.
+  const candidates = tabs.filter((tab) => {
+    const url = tab.url || tab.pendingUrl || '';
+    return /^https:\/\/leetcode\.(cn|com)\//.test(url);
+  });
+  let focusedWindowId;
+  try {
+    focusedWindowId = (await chrome.windows.getLastFocused())?.id;
+  } catch (_) { /* Fall back to tab flags only. */ }
+  const byRecency = (left, right) => {
+    const timeDiff = (right.lastAccessed || 0) - (left.lastAccessed || 0);
+    if (timeDiff) return timeDiff;
+    const score = (tab) =>
+      (tab.windowId && tab.windowId === focusedWindowId ? 2 : 0) +
+      (tab.active || tab.highlighted ? 1 : 0);
+    return score(right) - score(left);
+  };
+  // Prefer an exact URL match; otherwise fall back to matching the problem
+  // slug, which tolerates different domains (leetcode.cn / leetcode.com) and
+  // page shapes (/problems/xxx/, /problems/xxx/description/, /solutions/, ...).
+  const exactMatches = candidates
+    .filter((tab) => canonicalProblemUrl(tab.url || tab.pendingUrl) === targetUrl)
+    .sort(byRecency);
+  const slugMatches = candidates
+    .filter((tab) => targetSlug && problemSlug(tab.url || tab.pendingUrl) === targetSlug)
+    .sort(byRecency);
+  const matches = exactMatches.length ? exactMatches : slugMatches;
   if (!matches.length) throw new Error('未找到打开中的对应力扣题目页。');
 
   // For duplicate tabs, only the most recently active one is changed.

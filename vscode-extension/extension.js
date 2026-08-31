@@ -85,7 +85,9 @@ function frame(payload) {
 }
 
 function sendSocket(client, payload) {
-  if (!client.socket.destroyed) client.socket.write(frame(payload));
+  if (!client.socket.writable || client.socket.destroyed) return false;
+  client.socket.write(frame(payload));
+  return true;
 }
 
 function handleSocketMessage(client, message) {
@@ -154,23 +156,36 @@ function acceptWebSocket(request, socket) {
 }
 
 function requestBrowserApply(payload) {
-  const clients = [...socketClients].filter((client) => !client.socket.destroyed);
-  if (!clients.length) return Promise.reject(new Error('未连接 Edge 扩展。请在 edge://extensions 重新加载扩展，然后重试。'));
   const requestId = crypto.randomUUID();
+  const message = { type: 'applyCode', requestId, ...payload };
+  const clients = [...socketClients].filter((client) => client.socket.writable && !client.socket.destroyed);
+  if (!clients.length) {
+    return Promise.reject(new Error('未连接 Edge 扩展。请在 edge://extensions 重新加载扩展，然后重试。'));
+  }
+  // Handle each client individually so one stale socket cannot fail the whole
+  // sync; drop dead clients from the set so later attempts stop targeting them.
+  let remaining = 0;
+  for (const client of clients) {
+    try {
+      if (sendSocket(client, message)) {
+        remaining += 1;
+      } else {
+        socketClients.delete(client);
+      }
+    } catch (error) {
+      socketClients.delete(client);
+      outputChannel.appendLine(`Removed dead browser client: ${error.message}`);
+    }
+  }
+  if (!remaining) {
+    return Promise.reject(new Error('未连接 Edge 扩展。请在 edge://extensions 重新加载扩展，然后重试。'));
+  }
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pendingApplies.delete(requestId);
-      reject(new Error('等待浏览器响应超时。请确认对应力扣页面已打开。'));
+      reject(new Error('等待浏览器响应超时。请查看 LeetCode CPH Receiver 输出面板确认 Edge 扩展已连接，并确认对应力扣页面已打开。'));
     }, 10_000);
-    pendingApplies.set(requestId, { resolve, reject, timeout, remaining: clients.length });
-    const message = { type: 'applyCode', requestId, ...payload };
-    try {
-      clients.forEach((client) => sendSocket(client, message));
-    } catch (error) {
-      clearTimeout(timeout);
-      pendingApplies.delete(requestId);
-      reject(error);
-    }
+    pendingApplies.set(requestId, { resolve, reject, timeout, remaining });
   });
 }
 
