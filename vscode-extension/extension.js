@@ -4,10 +4,12 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs/promises');
 
+const { ApplyTracker } = require('./apply-tracker');
+
 let server;
 let outputChannel;
+let applyTracker;
 const socketClients = new Set();
-const pendingApplies = new Map();
 
 const EXTENSIONS = {
   c: 'c', cpp: 'cpp', 'c++': 'cpp', java: 'java', python: 'py', python3: 'py',
@@ -105,6 +107,7 @@ function heartbeat() {
   for (const client of [...socketClients]) {
     if (!client.socket.writable || client.socket.destroyed) {
       socketClients.delete(client);
+      applyTracker?.handleClientClosed(client);
       continue;
     }
     if (now - client.lastSeen > CLIENT_STALE_MS) {
@@ -113,9 +116,13 @@ function heartbeat() {
       continue;
     }
     try {
-      if (!sendSocket(client, { type: 'ping' })) socketClients.delete(client);
+      if (!sendSocket(client, { type: 'ping' })) {
+        socketClients.delete(client);
+        applyTracker?.handleClientClosed(client);
+      }
     } catch (error) {
       socketClients.delete(client);
+      applyTracker?.handleClientClosed(client);
     }
   }
 }
@@ -131,21 +138,7 @@ function handleSocketMessage(client, message) {
     return;
   }
   if (message?.type !== 'applyResult' || !message.requestId) return;
-  const pending = pendingApplies.get(message.requestId);
-  if (!pending) return;
-  pending.responded.add(client);
-  if (message.ok) {
-    clearTimeout(pending.timeout);
-    pendingApplies.delete(message.requestId);
-    pending.resolve(message.result);
-    return;
-  }
-  pending.remaining -= 1;
-  if (pending.remaining <= 0) {
-    clearTimeout(pending.timeout);
-    pendingApplies.delete(message.requestId);
-    pending.reject(new Error(message.error || '浏览器同步失败。'));
-  }
+  applyTracker.handleApplyResult(client, message);
 }
 
 function consumeSocketData(client, chunk) {
@@ -187,8 +180,14 @@ function acceptWebSocket(request, socket) {
   socketClients.add(client);
   socket.setNoDelay(true);
   socket.on('data', (chunk) => consumeSocketData(client, chunk));
-  socket.on('close', () => socketClients.delete(client));
-  socket.on('error', () => socketClients.delete(client));
+  socket.on('close', () => {
+    socketClients.delete(client);
+    applyTracker.handleClientClosed(client);
+  });
+  socket.on('error', () => {
+    socketClients.delete(client);
+    applyTracker.handleClientClosed(client);
+  });
 }
 
 function requestBrowserApply(payload) {
@@ -219,21 +218,11 @@ function requestBrowserApply(payload) {
     return Promise.reject(new Error('未连接 Edge 扩展。请确认 Edge 已打开且扩展已加载；扩展每 30 秒会自动重连，若刚启动浏览器请稍候再试。'));
   }
   return new Promise((resolve, reject) => {
-    const record = { resolve, reject, timeout: null, remaining, sentClients, responded: new Set() };
-    record.timeout = setTimeout(() => {
-      pendingApplies.delete(requestId);
-      // A client that never answered is a zombie (for example a service worker
-      // the browser terminated); drop it so the next sync fails fast instead of
-      // hanging again, and so the Edge extension reconnects cleanly.
-      for (const client of record.sentClients) {
-        if (!record.responded.has(client) && !client.socket.destroyed) {
-          outputChannel.appendLine('Dropping unresponsive browser client after apply timeout.');
-          client.socket.destroy();
-        }
-      }
-      reject(new Error('等待浏览器响应超时：浏览器扩展可能已休眠，未响应的连接已自动断开，扩展会自行重连，请稍后重试；若仍失败，请在 edge://extensions 重新加载扩展。'));
-    }, 10_000);
-    pendingApplies.set(requestId, record);
+    applyTracker.create(requestId, sentClients, {
+      onSuccess: (result) => resolve(result),
+      onFailure: (error) => reject(error),
+      onTimeout: () => reject(new Error('等待浏览器响应超时：浏览器扩展可能已休眠，未响应的连接已自动断开，扩展会自行重连，请稍后重试；若仍失败，请在 edge://extensions 重新加载扩展。'))
+    });
   });
 }
 
@@ -307,6 +296,7 @@ function startServer() {
 
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('LeetCode CPH Receiver');
+  applyTracker = new ApplyTracker({ log: (line) => outputChannel.appendLine(line) });
   startServer();
   heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
   context.subscriptions.push(outputChannel, { dispose: () => { clearInterval(heartbeatTimer); server?.close(); } });
@@ -323,11 +313,7 @@ function activate(context) {
 
 function deactivate() {
   clearInterval(heartbeatTimer);
-  for (const pending of pendingApplies.values()) {
-    clearTimeout(pending.timeout);
-    pending.reject(new Error('VS Code 扩展已停止。'));
-  }
-  pendingApplies.clear();
+  applyTracker?.disposeAll('VS Code 扩展已停止。');
   for (const client of socketClients) client.socket.destroy();
   return new Promise((resolve) => server?.close(resolve) || resolve());
 }

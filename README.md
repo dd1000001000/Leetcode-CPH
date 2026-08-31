@@ -41,6 +41,21 @@ VS Code 设置中可修改：
 
 插件仅向本机 `127.0.0.1` 发数据。它优先读取 LeetCode 的 Monaco 编辑器模型；页面改版时会尝试 textarea、CodeMirror 和编辑器 DOM 作为回退方式。
 
+## URL 兼容范围
+
+- 支持的力扣域名：`leetcode.com`、`leetcode.cn` 以及旧域名 `leetcode-cn.com`，均接受可选的 `www.` 前缀。
+- 同一道题的所有路径变体视为同一道题：`/problems/<slug>/`、`/description/`、`/submissions/`、`/solutions/`、`/solution/<id>/` 等。
+- 从 VS Code 回传代码时优先匹配与 `metadata.json` 中来源**同域同题**的标签页，找不到时才匹配**跨域同题**的标签页；多个同题标签页只更新最近活动的一个，其余不计入改动。
+
+## InPrivate 窗口
+
+Edge 的 InPrivate 窗口默认不加载扩展。若需要在 InPrivate 中抓取或回传代码，请在 `edge://extensions` 的扩展详情中打开“允许 InPrivate 中使用”开关，然后重新打开 InPrivate 窗口。若 InPrivate 页面上扩展角标不生效，请先检查该开关。
+
+## 开发与测试
+
+- 运行全部测试（共享 URL matcher 与 WebSocket 生命周期）：`node --test test/`（或 `npm test`）。
+- 原有临时校验脚本（在 vm 沙箱中加载真实扩展文件）：`node .tmp-test-background.js`、`node .tmp-test-collector.js`。
+
 ## License
 
 [MIT](./LICENSE)

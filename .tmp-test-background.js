@@ -1,6 +1,7 @@
 // Temporary assertion script for edge-extension/background.js matching logic.
 // Loads the real service-worker file in a vm sandbox with chrome/WebSocket stubs.
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
 const source = fs.readFileSync('edge-extension/background.js', 'utf8');
@@ -49,6 +50,11 @@ const sandbox = {
   clearTimeout,
   fetch: async () => ({ ok: false, status: 0, json: async () => ({}) })
 };
+// background.js loads the shared matcher via importScripts('url-matcher.js');
+// mirror that inside the sandbox by running the real file in the same context.
+sandbox.importScripts = (file) => {
+  vm.runInContext(fs.readFileSync(path.join('edge-extension', file), 'utf8'), sandbox, { filename: file });
+};
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 
@@ -59,10 +65,11 @@ function assert(name, condition, detail) {
   else { failed += 1; console.log(`FAIL ${name}${detail ? ` -- ${detail}` : ''}`); }
 }
 
-// problemSlug unit checks
-assert('slug: case normalization', sandbox.problemSlug('https://leetcode.cn/problems/Two-Sum/description/?envType=x') === 'two-sum');
-assert('slug: same slug across domains', sandbox.problemSlug('https://leetcode.com/problems/two-sum/') === sandbox.problemSlug('https://leetcode.cn/problems/two-sum/description/'));
-assert('slug: non-problem URL returns empty', sandbox.problemSlug('https://leetcode.cn/problemset/') === '');
+// Shared matcher (url-matcher.js) problemSlug unit checks
+const { problemSlug } = sandbox.LeetCodeUrlMatcher;
+assert('slug: case normalization', problemSlug('https://leetcode.cn/problems/Two-Sum/description/?envType=x') === 'two-sum');
+assert('slug: same slug across domains', problemSlug('https://leetcode.com/problems/two-sum/') === problemSlug('https://leetcode.cn/problems/two-sum/description/'));
+assert('slug: non-problem URL returns empty', problemSlug('https://leetcode.cn/problemset/') === '');
 
 async function runApply(sourceUrl, tabs) {
   testTabs = tabs;
@@ -75,12 +82,13 @@ async function runApply(sourceUrl, tabs) {
 }
 
 (async () => {
-  // Exact canonical match preferred over slug-only tab.
+  // Same-domain same-problem variants are equal; recency picks the winner.
   let r = await runApply('https://leetcode.cn/problems/two-sum/description/?envType=x', [
     { id: 1, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 100 },
     { id: 2, url: 'https://leetcode.cn/problems/two-sum/', lastAccessed: 200 }
   ]);
-  assert('exact match preferred over slug-only tab', r.ok && r.result.tabId === 1, JSON.stringify(r));
+  assert('same-domain variants tie-break by recency', r.ok && r.result.tabId === 2, JSON.stringify(r));
+  assert('duplicates count all same-problem tabs', r.ok && r.result.duplicates === 1, JSON.stringify(r));
 
   // Slug fallback: no /description/ variant.
   r = await runApply('https://leetcode.cn/problems/two-sum/description/?envType=x', [
@@ -124,6 +132,12 @@ async function runApply(sourceUrl, tabs) {
     { id: 9, url: 'https://example.com/other', lastAccessed: 999 }
   ]);
   assert('non-leetcode tabs excluded', !r.ok, JSON.stringify(r));
+
+  // www. prefix is normalized away, so www pages are valid candidates.
+  r = await runApply('https://leetcode.com/problems/two-sum/', [
+    { id: 10, url: 'https://www.leetcode.com/problems/two-sum/description/', lastAccessed: 1000 }
+  ]);
+  assert('www. prefix treated as same domain', r.ok && r.result.tabId === 10, JSON.stringify(r));
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

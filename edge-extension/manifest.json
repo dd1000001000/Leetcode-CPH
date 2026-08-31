@@ -6,7 +6,9 @@
   "permissions": ["activeTab", "tabs", "scripting", "alarms"],
   "host_permissions": [
     "https://leetcode.cn/*",
+    "https://www.leetcode.cn/*",
     "https://leetcode.com/*",
+    "https://www.leetcode.com/*",
     "http://127.0.0.1:27121/*"
   ],
   "action": {

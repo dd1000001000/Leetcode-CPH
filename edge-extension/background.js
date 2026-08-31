@@ -1,5 +1,11 @@
 const RECEIVER_URL = 'http://127.0.0.1:27121/capture';
 const SOCKET_URL = 'ws://127.0.0.1:27121/ws';
+
+// Shared LeetCode URL matcher (see url-matcher.js): LeetCode-domain
+// restriction, www. normalization, path-variant handling, and
+// same-domain/cross-domain ranking.
+importScripts('url-matcher.js');
+const { isLeetCodeUrl, matchScore } = globalThis.LeetCodeUrlMatcher;
 let receiverSocket;
 let reconnectTimer;
 
@@ -42,24 +48,6 @@ function connectReceiver() {
   }
 }
 
-function canonicalProblemUrl(value) {
-  try {
-    const url = new URL(value);
-    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
-  } catch (_) {
-    return '';
-  }
-}
-
-function problemSlug(value) {
-  try {
-    const match = new URL(value).pathname.match(/\/problems\/([^/?#]+)/);
-    return match ? decodeURIComponent(match[1]).toLowerCase() : '';
-  } catch (_) {
-    return '';
-  }
-}
-
 async function collect(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -83,15 +71,12 @@ async function collect(tabId) {
   return result.result.payload;
 }
 
-const LEETCODE_TAB_RE = /^https:\/\/leetcode(-cn)?\.(cn|com)\//;
 // Prefer `tab.pendingUrl` over `tab.url`: while a tab is navigating, `url`
 // still points at the previous page (or about:blank) and would hide the
 // LeetCode destination the user just opened.
 const tabTargetUrl = (tab) => tab.pendingUrl || tab.url || '';
 
 async function applyCodeToMatchingTab(message) {
-  const targetUrl = canonicalProblemUrl(message.source);
-  const targetSlug = problemSlug(message.source);
   let focusedWindowId;
   try {
     focusedWindowId = (await chrome.windows.getLastFocused())?.id;
@@ -112,22 +97,22 @@ async function applyCodeToMatchingTab(message) {
   // page should still succeed.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const tabs = await chrome.tabs.query({});
-    // Only LeetCode problem tabs are candidates. `tab.url` / `tab.pendingUrl`
+    // Candidates must be LeetCode domains with the same problem. The shared
+    // matcher ranks same-domain same-problem (2) above cross-domain
+    // same-problem (1), and treats path variants (/description/, /submissions/,
+    // /solutions/, ...) as one problem via the slug. `tab.url` / `tab.pendingUrl`
     // can be missing for some tab states, in which case the tab cannot match.
-    const candidates = tabs.filter((candidate) => LEETCODE_TAB_RE.test(tabTargetUrl(candidate)));
-    // Prefer an exact URL match; otherwise fall back to matching the problem
-    // slug, which tolerates different domains (leetcode.cn / leetcode.com /
-    // leetcode-cn.com) and page shapes (/problems/xxx/, /problems/xxx/description/,
-    // /solutions/, ...).
-    const exactMatches = candidates
-      .filter((candidate) => canonicalProblemUrl(tabTargetUrl(candidate)) === targetUrl)
-      .sort(byRecency);
-    const slugMatches = candidates
-      .filter((candidate) => targetSlug && problemSlug(tabTargetUrl(candidate)) === targetSlug)
-      .sort(byRecency);
-    matches = exactMatches.length ? exactMatches : slugMatches;
+    matches = tabs
+      .map((candidate) => ({ candidate, score: matchScore(message.source, tabTargetUrl(candidate)) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => {
+        const scoreDiff = right.score - left.score;
+        return scoreDiff || byRecency(left.candidate, right.candidate);
+      })
+      .map((entry) => entry.candidate);
     if (matches.length) {
-      // For duplicate tabs, only the most recently active one is changed.
+      // For duplicate tabs, only the most recently active one is changed;
+      // `matches.length - 1` counts every other same-problem tab left untouched.
       tab = matches[0];
       break;
     }
@@ -164,8 +149,8 @@ async function handleReceiverMessage(message) {
 chrome.action.onClicked.addListener(async (tab) => {
   const tabId = tab.id;
   try {
-    if (!tabId || !LEETCODE_TAB_RE.test(tab.url || '')) {
-      throw new Error('请先打开 leetcode.cn 或 leetcode.com 的题目页面。');
+    if (!tabId || !isLeetCodeUrl(tab.url || '')) {
+      throw new Error('请先打开力扣题目页面（leetcode.cn / leetcode.com，含 www 前缀）。');
     }
     await setState(tabId, '...', '#1677ff', '正在带走题目和代码…');
     const payload = await collect(tabId);
