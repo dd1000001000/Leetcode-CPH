@@ -22,6 +22,23 @@
     return fromQuestionLink || fromTitle || fromPath || '';
   }
 
+  // 题目在力扣上有多个页面变体（/description、/solutions、/submissions、
+  // /solution/<id> 等），但都对应同一道题。slug 只从 /problems/<slug> 提取，
+  // 忽略后续段与查询参数，因此三个变体得到同一身份。
+  function problemSlug() {
+    const match = location.pathname.match(/\/problems\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]).toLowerCase() : '';
+  }
+
+  function problemUrl(slug) {
+    if (!slug) return '';
+    try {
+      return `${location.protocol}//${location.host}/problems/${slug}/`;
+    } catch (_) {
+      return '';
+    }
+  }
+
   function description() {
     const candidates = [
       '[data-track-load="description_content"]',
@@ -138,8 +155,11 @@
   window.__LEETCODE_CPH_COLLECT__ = () => {
       const problemTitle = title();
       const problemText = description();
+      const slug = problemSlug();
       return {
         source: location.href,
+        problemSlug: slug,
+        problemUrl: problemUrl(slug),
         title: problemTitle,
         problemId: problemId(problemTitle),
         description: problemText,
