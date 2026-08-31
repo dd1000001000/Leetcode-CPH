@@ -23,7 +23,7 @@
 2. 在 VS Code 打开该题目目录中的 `solution.*`，可以是未保存的编辑内容。
 3. 按 `Ctrl+Shift+P`，运行 **LeetCode CPH: Send Current Solution to Browser**。
 
-扩展会读取同目录 `metadata.json` 中的题目链接，只把代码写回对应题目。若同一题在多个 Edge 窗口/标签页中打开，只更新最近活动的一个；若浏览器语言与本地抓取语言不一致，扩展会拒绝同步，避免覆盖错误语言的编辑器。
+扩展会读取同目录 `metadata.json` 中的题目链接，只把代码写回对应题目。若同一题在多个 Edge 窗口/标签页中打开，会优先选择标准题页、其次 `/description/`、再是其他子页面，路径等级相同才取最近活动的一个（详见下文“URL 兼容范围”）；若浏览器语言与本地抓取语言不一致，扩展会拒绝同步，避免覆盖错误语言的编辑器。
 
 若提示“浏览器扩展未连接”或同步超时，通常只是 Edge 扩展的服务进程处于休眠：扩展每 30 秒会自动重连，等待约半分钟重试即可；仍失败时可在 `edge://extensions` 重新加载扩展。
 
@@ -43,9 +43,10 @@ VS Code 设置中可修改：
 
 ## URL 兼容范围
 
-- 支持的力扣域名：`leetcode.com`、`leetcode.cn` 以及旧域名 `leetcode-cn.com`，均接受可选的 `www.` 前缀。
+- 支持的力扣域名：`leetcode.com`、`leetcode.cn`，均接受可选的 `www.` 前缀；旧域名 `leetcode-cn.com` 不再支持（与扩展 `manifest.json` 的 `host_permissions` 保持一致）。
 - 同一道题的所有路径变体视为同一道题：`/problems/<slug>/`、`/description/`、`/submissions/`、`/solutions/`、`/solution/<id>/` 等。
-- 从 VS Code 回传代码时优先匹配与 `metadata.json` 中来源**同域同题**的标签页，找不到时才匹配**跨域同题**的标签页；多个同题标签页只更新最近活动的一个，其余不计入改动。
+- 从 VS Code 回传代码时优先匹配与 `metadata.json` 中来源**同域同题**的标签页，找不到时才匹配**跨域同题**的标签页。
+- 同域同题的多个标签页按页面路径优先级选择：标准题页 `/problems/<slug>/` 优先，其次 `/description/`，再是 `/submissions/`、`/solutions/`、`/solution/<id>/` 等子页面；路径等级相同才按最近访问时间（以及当前窗口/活动标签）选择，其余同题标签页不计入改动。
 
 ## InPrivate 窗口
 

@@ -5,7 +5,7 @@ const SOCKET_URL = 'ws://127.0.0.1:27121/ws';
 // restriction, www. normalization, path-variant handling, and
 // same-domain/cross-domain ranking.
 importScripts('url-matcher.js');
-const { isLeetCodeUrl, matchScore } = globalThis.LeetCodeUrlMatcher;
+const { isLeetCodeUrl, matchScore, pathRank } = globalThis.LeetCodeUrlMatcher;
 let receiverSocket;
 let reconnectTimer;
 
@@ -107,7 +107,13 @@ async function applyCodeToMatchingTab(message) {
       .filter((entry) => entry.score > 0)
       .sort((left, right) => {
         const scoreDiff = right.score - left.score;
-        return scoreDiff || byRecency(left.candidate, right.candidate);
+        if (scoreDiff) return scoreDiff;
+        // Same-domain same-problem tabs are ordered by path rank first: the
+        // standard /problems/<slug>/ page, then /description/, then subpages
+        // (/submissions/, /solutions/, /solution/<id>/ ...). Equal path ranks
+        // fall back to the existing recency / focused-window / active rules.
+        const rankDiff = pathRank(tabTargetUrl(left.candidate)) - pathRank(tabTargetUrl(right.candidate));
+        return rankDiff || byRecency(left.candidate, right.candidate);
       })
       .map((entry) => entry.candidate);
     if (matches.length) {
@@ -118,7 +124,7 @@ async function applyCodeToMatchingTab(message) {
     }
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 600));
   }
-  if (!tab) throw new Error('未找到打开中的对应力扣题目页。请确认题目页已加载完成；若刚打开页面，请稍候重试。');
+  if (!tab) throw new Error('未找到打开中的对应力扣题目页。请确认题目页已加载完成；若刚打开页面，请稍候重试。请确认题目 slug 一致；已支持 .com/.cn、www 和常见题目子页面；若页面位于 InPrivate 窗口，请在 edge://extensions 的扩展详情中开启“允许 InPrivate 中使用”。');
   await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     files: ['page-collector.js'],

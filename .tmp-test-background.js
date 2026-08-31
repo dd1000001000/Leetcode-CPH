@@ -66,10 +66,11 @@ function assert(name, condition, detail) {
 }
 
 // Shared matcher (url-matcher.js) problemSlug unit checks
-const { problemSlug } = sandbox.LeetCodeUrlMatcher;
+const { problemSlug, isLeetCodeUrl } = sandbox.LeetCodeUrlMatcher;
 assert('slug: case normalization', problemSlug('https://leetcode.cn/problems/Two-Sum/description/?envType=x') === 'two-sum');
 assert('slug: same slug across domains', problemSlug('https://leetcode.com/problems/two-sum/') === problemSlug('https://leetcode.cn/problems/two-sum/description/'));
 assert('slug: non-problem URL returns empty', problemSlug('https://leetcode.cn/problemset/') === '');
+assert('legacy leetcode-cn.com rejected (matches manifest host_permissions)', !isLeetCodeUrl('https://leetcode-cn.com/problems/two-sum/'));
 
 async function runApply(sourceUrl, tabs) {
   testTabs = tabs;
@@ -82,13 +83,21 @@ async function runApply(sourceUrl, tabs) {
 }
 
 (async () => {
-  // Same-domain same-problem variants are equal; recency picks the winner.
+  // Same-domain same-problem: the standard /problems/<slug>/ page wins over a
+  // more recent /description/ tab (path rank beats recency).
   let r = await runApply('https://leetcode.cn/problems/two-sum/description/?envType=x', [
-    { id: 1, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 100 },
-    { id: 2, url: 'https://leetcode.cn/problems/two-sum/', lastAccessed: 200 }
+    { id: 1, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 900 },
+    { id: 2, url: 'https://leetcode.cn/problems/two-sum/', lastAccessed: 100 }
   ]);
-  assert('same-domain variants tie-break by recency', r.ok && r.result.tabId === 2, JSON.stringify(r));
+  assert('path rank: standard page beats more recent /description/', r.ok && r.result.tabId === 2, JSON.stringify(r));
   assert('duplicates count all same-problem tabs', r.ok && r.result.duplicates === 1, JSON.stringify(r));
+
+  // Equal path rank: recency picks the winner.
+  r = await runApply('https://leetcode.cn/problems/two-sum/description/', [
+    { id: 1, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 100 },
+    { id: 2, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 200 }
+  ]);
+  assert('equal path rank tie-breaks by recency', r.ok && r.result.tabId === 2, JSON.stringify(r));
 
   // Slug fallback: no /description/ variant.
   r = await runApply('https://leetcode.cn/problems/two-sum/description/?envType=x', [
@@ -120,12 +129,20 @@ async function runApply(sourceUrl, tabs) {
   ]);
   assert('different slug does not match', !r.ok, JSON.stringify(r));
 
-  // Recency: most recently accessed tab wins among slug matches.
+  // Path rank beats recency even across domains: an old standard page wins
+  // over a recent /description/ tab.
   r = await runApply('https://leetcode.com/problems/two-sum/', [
     { id: 7, url: 'https://leetcode.cn/problems/two-sum/', lastAccessed: 100 },
     { id: 8, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 900 }
   ]);
-  assert('recency sort picks most recent', r.ok && r.result.tabId === 8, JSON.stringify(r));
+  assert('path rank beats recency across variants', r.ok && r.result.tabId === 7, JSON.stringify(r));
+
+  // Same-domain (score 2) outranks a more recent cross-domain (score 1) tab.
+  r = await runApply('https://leetcode.cn/problems/two-sum/', [
+    { id: 11, url: 'https://leetcode.com/problems/two-sum/', lastAccessed: 999 },
+    { id: 12, url: 'https://leetcode.cn/problems/two-sum/description/', lastAccessed: 10 }
+  ]);
+  assert('same-domain beats more recent cross-domain', r.ok && r.result.tabId === 12, JSON.stringify(r));
 
   // Non-leetcode tabs are excluded.
   r = await runApply('https://leetcode.cn/problems/two-sum/', [

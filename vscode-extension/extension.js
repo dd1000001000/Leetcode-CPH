@@ -86,10 +86,29 @@ function frame(payload) {
   return Buffer.concat([header, body]);
 }
 
+// Central client teardown. Every disconnect path funnels through here so a
+// failed/closed socket is removed from the candidate set AND from all pending
+// applies: a request whose last candidate vanished fails fast with
+// “浏览器连接已断开” instead of hanging until the apply timeout.
+function removeClient(client, reason) {
+  socketClients.delete(client);
+  applyTracker?.handleClientClosed(client);
+  if (reason) outputChannel?.appendLine(`Removed browser client (${client.name || 'unknown'}: ${reason}).`);
+  if (!client.socket.destroyed) client.socket.destroy();
+}
+
 function sendSocket(client, payload) {
-  if (!client.socket.writable || client.socket.destroyed) return false;
-  client.socket.write(frame(payload));
-  return true;
+  if (!client.socket.writable || client.socket.destroyed) {
+    removeClient(client);
+    return false;
+  }
+  try {
+    client.socket.write(frame(payload));
+    return true;
+  } catch (error) {
+    removeClient(client, `write failed: ${error.message}`);
+    return false;
+  }
 }
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -106,24 +125,14 @@ function heartbeat() {
   const now = Date.now();
   for (const client of [...socketClients]) {
     if (!client.socket.writable || client.socket.destroyed) {
-      socketClients.delete(client);
-      applyTracker?.handleClientClosed(client);
+      removeClient(client);
       continue;
     }
     if (now - client.lastSeen > CLIENT_STALE_MS) {
-      outputChannel.appendLine(`Removed unresponsive browser client (${client.name}).`);
-      client.socket.destroy();
+      removeClient(client, 'unresponsive');
       continue;
     }
-    try {
-      if (!sendSocket(client, { type: 'ping' })) {
-        socketClients.delete(client);
-        applyTracker?.handleClientClosed(client);
-      }
-    } catch (error) {
-      socketClients.delete(client);
-      applyTracker?.handleClientClosed(client);
-    }
+    sendSocket(client, { type: 'ping' });
   }
 }
 
@@ -154,7 +163,7 @@ function consumeSocketData(client, chunk) {
       length = client.buffer.readUInt16BE(2);
       offset = 4;
     } else if (length === 127) {
-      client.socket.destroy();
+      removeClient(client, 'frame too large');
       return;
     }
     const masked = Boolean(second & 0x80);
@@ -180,14 +189,8 @@ function acceptWebSocket(request, socket) {
   socketClients.add(client);
   socket.setNoDelay(true);
   socket.on('data', (chunk) => consumeSocketData(client, chunk));
-  socket.on('close', () => {
-    socketClients.delete(client);
-    applyTracker.handleClientClosed(client);
-  });
-  socket.on('error', () => {
-    socketClients.delete(client);
-    applyTracker.handleClientClosed(client);
-  });
+  socket.on('close', () => removeClient(client));
+  socket.on('error', () => removeClient(client, 'socket error'));
 }
 
 function requestBrowserApply(payload) {
@@ -198,20 +201,14 @@ function requestBrowserApply(payload) {
     return Promise.reject(new Error('未连接 Edge 扩展。请确认 Edge 已打开且扩展已加载；扩展每 30 秒会自动重连，若刚启动浏览器请稍候再试。'));
   }
   // Handle each client individually so one stale socket cannot fail the whole
-  // sync; drop dead clients from the set so later attempts stop targeting them.
+  // sync. Failed writes funnel through sendSocket → removeClient, which both
+  // drops the dead socket and settles any pending applies waiting on it.
   let remaining = 0;
   const sentClients = [];
   for (const client of clients) {
-    try {
-      if (sendSocket(client, message)) {
-        remaining += 1;
-        sentClients.push(client);
-      } else {
-        socketClients.delete(client);
-      }
-    } catch (error) {
-      socketClients.delete(client);
-      outputChannel.appendLine(`Removed dead browser client: ${error.message}`);
+    if (sendSocket(client, message)) {
+      remaining += 1;
+      sentClients.push(client);
     }
   }
   if (!remaining) {
