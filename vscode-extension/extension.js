@@ -90,15 +90,50 @@ function sendSocket(client, payload) {
   return true;
 }
 
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const CLIENT_STALE_MS = 60_000;
+let heartbeatTimer;
+
+// The Edge extension lives in a Manifest V3 service worker, which the browser
+// may terminate while it is idle. That kills the WebSocket without VS Code
+// noticing, so a stale "zombie" client would otherwise make every sync hang
+// for 10 seconds with a misleading "page not open" error. Heartbeat + expiry
+// keeps the client list honest: the Edge side already answers {type:'ping'}
+// with {type:'pong'}, and it also sends its own ping every 30 seconds.
+function heartbeat() {
+  const now = Date.now();
+  for (const client of [...socketClients]) {
+    if (!client.socket.writable || client.socket.destroyed) {
+      socketClients.delete(client);
+      continue;
+    }
+    if (now - client.lastSeen > CLIENT_STALE_MS) {
+      outputChannel.appendLine(`Removed unresponsive browser client (${client.name}).`);
+      client.socket.destroy();
+      continue;
+    }
+    try {
+      if (!sendSocket(client, { type: 'ping' })) socketClients.delete(client);
+    } catch (error) {
+      socketClients.delete(client);
+    }
+  }
+}
+
 function handleSocketMessage(client, message) {
   if (message?.type === 'hello') {
     client.name = message.client || 'Edge';
     outputChannel.appendLine(`Browser connected: ${client.name}`);
     return;
   }
+  if (message?.type === 'ping') {
+    sendSocket(client, { type: 'pong' });
+    return;
+  }
   if (message?.type !== 'applyResult' || !message.requestId) return;
   const pending = pendingApplies.get(message.requestId);
   if (!pending) return;
+  pending.responded.add(client);
   if (message.ok) {
     clearTimeout(pending.timeout);
     pendingApplies.delete(message.requestId);
@@ -114,6 +149,7 @@ function handleSocketMessage(client, message) {
 }
 
 function consumeSocketData(client, chunk) {
+  client.lastSeen = Date.now();
   client.buffer = Buffer.concat([client.buffer, chunk]);
   while (client.buffer.length >= 2) {
     const first = client.buffer[0];
@@ -147,7 +183,7 @@ function acceptWebSocket(request, socket) {
   if (!key || Array.isArray(key)) return socket.destroy();
   const accept = crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-  const client = { socket, buffer: Buffer.alloc(0), name: 'unknown' };
+  const client = { socket, buffer: Buffer.alloc(0), name: 'unknown', lastSeen: Date.now() };
   socketClients.add(client);
   socket.setNoDelay(true);
   socket.on('data', (chunk) => consumeSocketData(client, chunk));
@@ -160,15 +196,17 @@ function requestBrowserApply(payload) {
   const message = { type: 'applyCode', requestId, ...payload };
   const clients = [...socketClients].filter((client) => client.socket.writable && !client.socket.destroyed);
   if (!clients.length) {
-    return Promise.reject(new Error('未连接 Edge 扩展。请在 edge://extensions 重新加载扩展，然后重试。'));
+    return Promise.reject(new Error('未连接 Edge 扩展。请确认 Edge 已打开且扩展已加载；扩展每 30 秒会自动重连，若刚启动浏览器请稍候再试。'));
   }
   // Handle each client individually so one stale socket cannot fail the whole
   // sync; drop dead clients from the set so later attempts stop targeting them.
   let remaining = 0;
+  const sentClients = [];
   for (const client of clients) {
     try {
       if (sendSocket(client, message)) {
         remaining += 1;
+        sentClients.push(client);
       } else {
         socketClients.delete(client);
       }
@@ -178,14 +216,24 @@ function requestBrowserApply(payload) {
     }
   }
   if (!remaining) {
-    return Promise.reject(new Error('未连接 Edge 扩展。请在 edge://extensions 重新加载扩展，然后重试。'));
+    return Promise.reject(new Error('未连接 Edge 扩展。请确认 Edge 已打开且扩展已加载；扩展每 30 秒会自动重连，若刚启动浏览器请稍候再试。'));
   }
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const record = { resolve, reject, timeout: null, remaining, sentClients, responded: new Set() };
+    record.timeout = setTimeout(() => {
       pendingApplies.delete(requestId);
-      reject(new Error('等待浏览器响应超时。请查看 LeetCode CPH Receiver 输出面板确认 Edge 扩展已连接，并确认对应力扣页面已打开。'));
+      // A client that never answered is a zombie (for example a service worker
+      // the browser terminated); drop it so the next sync fails fast instead of
+      // hanging again, and so the Edge extension reconnects cleanly.
+      for (const client of record.sentClients) {
+        if (!record.responded.has(client) && !client.socket.destroyed) {
+          outputChannel.appendLine('Dropping unresponsive browser client after apply timeout.');
+          client.socket.destroy();
+        }
+      }
+      reject(new Error('等待浏览器响应超时：浏览器扩展可能已休眠，未响应的连接已自动断开，扩展会自行重连，请稍后重试；若仍失败，请在 edge://extensions 重新加载扩展。'));
     }, 10_000);
-    pendingApplies.set(requestId, { resolve, reject, timeout, remaining });
+    pendingApplies.set(requestId, record);
   });
 }
 
@@ -260,7 +308,8 @@ function startServer() {
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('LeetCode CPH Receiver');
   startServer();
-  context.subscriptions.push(outputChannel, { dispose: () => server?.close() });
+  heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
+  context.subscriptions.push(outputChannel, { dispose: () => { clearInterval(heartbeatTimer); server?.close(); } });
   context.subscriptions.push(vscode.commands.registerCommand('leetcodeCph.openOutputFolder', async () => {
     const root = workspaceRoot();
     if (!root) return vscode.window.showWarningMessage('请先打开一个工作区文件夹。');
@@ -273,6 +322,7 @@ function activate(context) {
 }
 
 function deactivate() {
+  clearInterval(heartbeatTimer);
   for (const pending of pendingApplies.values()) {
     clearTimeout(pending.timeout);
     pending.reject(new Error('VS Code 扩展已停止。'));

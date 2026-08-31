@@ -83,17 +83,15 @@ async function collect(tabId) {
   return result.result.payload;
 }
 
+const LEETCODE_TAB_RE = /^https:\/\/leetcode(-cn)?\.(cn|com)\//;
+// Prefer `tab.pendingUrl` over `tab.url`: while a tab is navigating, `url`
+// still points at the previous page (or about:blank) and would hide the
+// LeetCode destination the user just opened.
+const tabTargetUrl = (tab) => tab.pendingUrl || tab.url || '';
+
 async function applyCodeToMatchingTab(message) {
   const targetUrl = canonicalProblemUrl(message.source);
   const targetSlug = problemSlug(message.source);
-  const tabs = await chrome.tabs.query({});
-  // Only LeetCode problem tabs are candidates. `tab.url` can be missing for
-  // some tab states (for example a pending navigation), so fall back to
-  // `tab.pendingUrl`.
-  const candidates = tabs.filter((tab) => {
-    const url = tab.url || tab.pendingUrl || '';
-    return /^https:\/\/leetcode\.(cn|com)\//.test(url);
-  });
   let focusedWindowId;
   try {
     focusedWindowId = (await chrome.windows.getLastFocused())?.id;
@@ -106,20 +104,36 @@ async function applyCodeToMatchingTab(message) {
       (tab.active || tab.highlighted ? 1 : 0);
     return score(right) - score(left);
   };
-  // Prefer an exact URL match; otherwise fall back to matching the problem
-  // slug, which tolerates different domains (leetcode.cn / leetcode.com) and
-  // page shapes (/problems/xxx/, /problems/xxx/description/, /solutions/, ...).
-  const exactMatches = candidates
-    .filter((tab) => canonicalProblemUrl(tab.url || tab.pendingUrl) === targetUrl)
-    .sort(byRecency);
-  const slugMatches = candidates
-    .filter((tab) => targetSlug && problemSlug(tab.url || tab.pendingUrl) === targetSlug)
-    .sort(byRecency);
-  const matches = exactMatches.length ? exactMatches : slugMatches;
-  if (!matches.length) throw new Error('未找到打开中的对应力扣题目页。');
 
-  // For duplicate tabs, only the most recently active one is changed.
-  const tab = matches[0];
+  let tab;
+  let matches = [];
+  // The page may have just been opened and the tab is still navigating, so
+  // re-query briefly before giving up; a fast sync right after opening the
+  // page should still succeed.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const tabs = await chrome.tabs.query({});
+    // Only LeetCode problem tabs are candidates. `tab.url` / `tab.pendingUrl`
+    // can be missing for some tab states, in which case the tab cannot match.
+    const candidates = tabs.filter((candidate) => LEETCODE_TAB_RE.test(tabTargetUrl(candidate)));
+    // Prefer an exact URL match; otherwise fall back to matching the problem
+    // slug, which tolerates different domains (leetcode.cn / leetcode.com /
+    // leetcode-cn.com) and page shapes (/problems/xxx/, /problems/xxx/description/,
+    // /solutions/, ...).
+    const exactMatches = candidates
+      .filter((candidate) => canonicalProblemUrl(tabTargetUrl(candidate)) === targetUrl)
+      .sort(byRecency);
+    const slugMatches = candidates
+      .filter((candidate) => targetSlug && problemSlug(tabTargetUrl(candidate)) === targetSlug)
+      .sort(byRecency);
+    matches = exactMatches.length ? exactMatches : slugMatches;
+    if (matches.length) {
+      // For duplicate tabs, only the most recently active one is changed.
+      tab = matches[0];
+      break;
+    }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 600));
+  }
+  if (!tab) throw new Error('未找到打开中的对应力扣题目页。请确认题目页已加载完成；若刚打开页面，请稍候重试。');
   await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     files: ['page-collector.js'],
@@ -150,7 +164,7 @@ async function handleReceiverMessage(message) {
 chrome.action.onClicked.addListener(async (tab) => {
   const tabId = tab.id;
   try {
-    if (!tabId || !/^https:\/\/leetcode\.(cn|com)\//.test(tab.url || '')) {
+    if (!tabId || !LEETCODE_TAB_RE.test(tab.url || '')) {
       throw new Error('请先打开 leetcode.cn 或 leetcode.com 的题目页面。');
     }
     await setState(tabId, '...', '#1677ff', '正在带走题目和代码…');
