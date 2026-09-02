@@ -1,61 +1,90 @@
-# LeetCode CPH：Edge + VS Code
+# LeetCode CPH
 
-在力扣题页点击一次，就把题目、题面、样例和当前编辑器里的代码保存到当前 VS Code 工作区。
+LeetCode CPH 让你在 LeetCode 网页和 VS Code 之间快速切换：抓取题目与样例、在侧边栏管理测试用例、借助 AI 生成测试脚手架，并把本地代码同步回 LeetCode。
+
+## 功能
+
+- 一键抓取当前 LeetCode 题目的题面、样例和编辑器代码到 VS Code 工作区。
+- 在 VS Code 左侧的 **LeetCode CPH** 侧边栏查看多组测试用例。
+- 手动新增或删除测试用例；测试名称按 `testcase 001`、`testcase 002` 的形式编号。
+- 配置 GLM、DeepSeek 或 Qwen 的 API Key，生成或更新本地测试脚手架。
+- 新增、删除测试用例后自动更新对应的测试脚手架。
+- 在侧边栏点击按钮，将当前本地解答同步回已打开的 LeetCode 页面。
+- 侧边栏内提供 GitHub Bug 反馈入口。
 
 ## 安装
 
-1. 在 Edge 打开 `edge://extensions`，启用“开发人员模式”，选择“加载解压缩的扩展”，并选择 [`edge-extension`](./edge-extension) 文件夹。
-2. 在 VS Code 中打开 [`vscode-extension`](./vscode-extension) 文件夹，按 `F5` 启动“扩展开发宿主”；或者使用 `vsce package` 打出 VSIX 后安装。
-3. 在这个扩展开发宿主窗口中打开你的刷题工作区。接收服务会自动监听 `http://127.0.0.1:27121`。
-4. 打开力扣题页并在编辑器中写代码，直接点击 Edge 工具栏的 **LeetCode CPH Capture** 图标。
+### 1. 安装 Edge 扩展
 
-图标角标会反馈结果：`...` 表示正在保存，`OK` 表示完成，`!` 表示失败；将鼠标悬停在图标上可查看原因或保存目录。
+1. 在 Edge 地址栏打开 `edge://extensions`。
+2. 开启“开发人员模式”。
+3. 点击“加载解压缩的扩展”，选择本仓库的 [`edge-extension`](./edge-extension) 文件夹。
 
-每题会写入工作区的 `leetcode/<题号-题名>/`：
+### 2. 安装 VS Code 插件
 
-- `solution.<语言扩展名>`：当前编辑器代码
-- `README.md`：题面和样例
-- `metadata.json`：原始抓取数据与来源链接
+如果已有 VSIX 安装包：
 
-## 从 VS Code 回传代码到浏览器
+1. 在 VS Code 打开“扩展”面板。
+2. 点击右上角 `...`，选择 **从 VSIX 安装…**。
+3. 选择 `leetcode-cph-receiver-*.vsix` 文件。
+4. 安装完成后执行 **Developer: Reload Window** 重载 VS Code。
 
-1. 保持对应题目的 LeetCode 页面处于打开状态，并在网页中选择与本地代码相同的语言。
-2. 在 VS Code 打开该题目目录中的 `solution.*`，可以是未保存的编辑内容。
-3. 按 `Ctrl+Shift+P`，运行 **LeetCode CPH: Send Current Solution to Browser**。
+如果需要从源码生成 VSIX，在项目根目录运行：
 
-扩展会读取同目录 `metadata.json` 中的题目链接，只把代码写回对应题目。若同一题在多个 Edge 窗口/标签页中打开，会优先选择标准题页、其次 `/description/`、再是其他子页面，路径等级相同才取最近活动的一个（详见下文“URL 兼容范围”）；若浏览器语言与本地抓取语言不一致，扩展会拒绝同步，避免覆盖错误语言的编辑器。
+```powershell
+Set-Location .\vscode-extension
+npx --yes @vscode/vsce@latest package --no-dependencies
+```
 
-若提示“浏览器扩展未连接”或同步超时，通常只是 Edge 扩展的服务进程处于休眠：扩展每 30 秒会自动重连，等待约半分钟重试即可；仍失败时可在 `edge://extensions` 重新加载扩展。
+生成的 VSIX 会位于 `vscode-extension` 文件夹中。也可以使用 VS Code 命令行工具安装：
 
-## 设置
+```powershell
+code --install-extension .\leetcode-cph-receiver-<version>.vsix
+```
 
-VS Code 设置中可修改：
+将 `<version>` 替换为实际生成的版本号，并在安装后重载 VS Code。
 
-- `leetcodeCph.port`：本地端口，默认 `27121`（需同时修改 Edge 扩展的 `background.js`）。
-- `leetcodeCph.outputDirectory`：输出目录，默认 `leetcode`。
-- `leetcodeCph.openSolutionAfterCapture`：收到后自动打开解答文件，默认开启。
+## 使用方法
 
-网页中选中的语言会决定解答文件后缀，例如 `C++17` → `solution.cpp`、`Python3` → `solution.py`、`Java 17` → `solution.java`。未能识别的语言会保存为 `solution.txt`。
+### 抓取题目
 
-## 说明
+1. 在 VS Code 中打开你的刷题工作区。
+2. 在 Edge 打开 LeetCode 题目页，并在网页编辑器中选择要使用的语言。
+3. 点击 Edge 工具栏中的 **LeetCode CPH Capture** 图标。
+4. VS Code 会保存题目和当前代码，并打开对应的 `solution.*` 文件。
 
-插件仅向本机 `127.0.0.1` 发数据。它优先读取 LeetCode 的 Monaco 编辑器模型；页面改版时会尝试 textarea、CodeMirror 和编辑器 DOM 作为回退方式。
+### 管理测试用例与生成测试代码
 
-## URL 兼容范围
+1. 打开题目对应的 `solution.*` 文件，或生成后的 `testcase.*` 文件。
+2. 点击 VS Code 左侧活动栏的 **LeetCode CPH** 图标。
+3. 在侧边栏查看 LeetCode 抓取到的样例；可填写输入和预期输出来新增测试用例，或删除不需要的用例。
+4. 首次使用时，点击 **配置 AI**，选择 GLM、DeepSeek 或 Qwen，并填写 API Key。
+5. 点击 **生成/更新测试脚手架**，为当前题目生成测试代码。
 
-- 支持的力扣域名：`leetcode.com`、`leetcode.cn`，均接受可选的 `www.` 前缀；旧域名 `leetcode-cn.com` 不再支持（与扩展 `manifest.json` 的 `host_permissions` 保持一致）。
-- 同一道题的所有路径变体视为同一道题：`/problems/<slug>/`、`/description/`、`/submissions/`、`/solutions/`、`/solution/<id>/` 等。
-- 从 VS Code 回传代码时优先匹配与 `metadata.json` 中来源**同域同题**的标签页，找不到时才匹配**跨域同题**的标签页。
-- 同域同题的多个标签页按页面路径优先级选择：标准题页 `/problems/<slug>/` 优先，其次 `/description/`，再是 `/submissions/`、`/solutions/`、`/solution/<id>/` 等子页面；路径等级相同才按最近访问时间（以及当前窗口/活动标签）选择，其余同题标签页不计入改动。
+之后每次新增或删除测试用例，插件都会自动更新测试脚手架。若你正在手动编辑测试脚手架，请先保存再执行这些操作。
 
-## InPrivate 窗口
+### 同步代码到 LeetCode
 
-Edge 的 InPrivate 窗口默认不加载扩展。若需要在 InPrivate 中抓取或回传代码，请在 `edge://extensions` 的扩展详情中打开“允许 InPrivate 中使用”开关，然后重新打开 InPrivate 窗口。若 InPrivate 页面上扩展角标不生效，请先检查该开关。
+1. 保持对应的 LeetCode 题目页处于打开状态。
+2. 确认网页编辑器语言与本地 `solution.*` 的语言一致。
+3. 在侧边栏点击 **同步代码到 LeetCode**。
 
-## 开发与测试
+同步按钮会使用当前编辑器中的代码，即使该文件尚未保存。旧的命令面板同步方式不再使用。
 
-- 运行全部测试（共享 URL matcher 与 WebSocket 生命周期）：`node --test test/`（或 `npm test`）。
-- 原有临时校验脚本（在 vm 沙箱中加载真实扩展文件）：`node .tmp-test-background.js`、`node .tmp-test-collector.js`。
+## AI 与数据提示
+
+- API Key 会安全保存在 VS Code 中，不会写入工作区文件。
+- 生成测试脚手架时，题面、当前解答和测试用例会发送给你选择的 AI Provider；请根据其服务条款和计费规则使用。
+- 重新抓取同一道题后，如果网页样例发生变化，侧边栏会提示你更新测试脚手架。
+
+## 常见问题
+
+- 若同步失败，请确认 Edge 扩展已启用、题目页仍然打开，并且网页语言与本地语言一致。
+- 若题目页位于 Edge InPrivate 窗口，请在扩展详情中开启“允许 InPrivate 中使用”。
+
+## 反馈
+
+可在侧边栏点击 **反馈 Bug**，或直接前往 [GitHub 仓库](https://github.com/dd1000001000/simple-leetcode-cph) 提交问题。
 
 ## License
 

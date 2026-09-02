@@ -1,25 +1,59 @@
 {
   "name": "leetcode-cph-receiver",
-  "displayName": "LeetCode CPH Receiver",
-  "description": "Receives a LeetCode problem and its current browser editor code from the companion Edge extension.",
-  "version": "0.2.0",
+  "displayName": "LeetCode CPH",
+  "description": "Capture LeetCode problems, manage test cases in the sidebar, generate AI test scaffolds, and sync code back to the browser.",
+  "version": "0.3.0",
   "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dd1000001000/simple-leetcode-cph.git"
+  },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
-  "activationEvents": ["onStartupFinished", "onCommand:leetcodeCph.openOutputFolder", "onCommand:leetcodeCph.sendCurrentSolution"],
+  "activationEvents": ["onStartupFinished", "onView:leetcodeCph.sidebar", "onCommand:leetcodeCph.openOutputFolder"],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       { "command": "leetcodeCph.openOutputFolder", "title": "LeetCode CPH: Open Output Folder" },
-      { "command": "leetcodeCph.showStatus", "title": "LeetCode CPH: Show Receiver Status" },
-      { "command": "leetcodeCph.sendCurrentSolution", "title": "LeetCode CPH: Send Current Solution to Browser" }
+      { "command": "leetcodeCph.showStatus", "title": "LeetCode CPH: Show Receiver Status" }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "leetcodeCph",
+          "title": "LeetCode CPH",
+          "icon": "media/leetcode-cph.svg"
+        }
+      ]
+    },
+    "views": {
+      "leetcodeCph": [
+        {
+          "type": "webview",
+          "id": "leetcodeCph.sidebar",
+          "name": "测试用例"
+        }
+      ]
+    },
     "configuration": {
-      "title": "LeetCode CPH Receiver",
+      "title": "LeetCode CPH",
       "properties": {
         "leetcodeCph.port": { "type": "number", "default": 27121, "minimum": 1024, "maximum": 65535, "description": "Local port used by the companion Edge extension." },
         "leetcodeCph.outputDirectory": { "type": "string", "default": "leetcode", "description": "Folder, relative to the current workspace, where captured problems are stored." },
-        "leetcodeCph.openSolutionAfterCapture": { "type": "boolean", "default": true, "description": "Open the saved solution file after a capture arrives." }
+        "leetcodeCph.openSolutionAfterCapture": { "type": "boolean", "default": true, "description": "Open the saved solution file after a capture arrives." },
+        "leetcodeCph.ai.provider": {
+          "type": "string",
+          "default": "glm",
+          "enum": ["glm", "deepseek", "qwen"],
+          "enumDescriptions": ["GLM", "DeepSeek", "Qwen"],
+          "description": "AI provider used to generate the local testcase scaffold. Its API key is stored only in VS Code SecretStorage."
+        },
+        "leetcodeCph.ai.model": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model name for the selected AI provider. Leave empty to use the extension default."
+        }
       }
     }
   }

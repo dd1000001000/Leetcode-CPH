@@ -57,6 +57,9 @@ function createSandbox() {
       if (name === 'path') return path;
       if (name === 'fs/promises') return require('fs/promises');
       if (name === './apply-tracker') return { ApplyTracker };
+      if (name === './sidebar-provider') return require('../vscode-extension/sidebar-provider');
+      if (name === './testcase-store') return require('../vscode-extension/testcase-store');
+      if (name === './ai-testcase-service') return require('../vscode-extension/ai-testcase-service');
       throw new Error(`Unexpected require: ${name}`);
     }
   };

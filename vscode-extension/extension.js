@@ -5,11 +5,32 @@ const path = require('path');
 const fs = require('fs/promises');
 
 const { ApplyTracker } = require('./apply-tracker');
+const { LeetCodeCphSidebarProvider } = require('./sidebar-provider');
+const {
+  TEST_CASES_FILE,
+  fromCapturePayload,
+  mergeCaptureTestCases,
+  loadTestCaseState,
+  loadTestCases,
+  saveTestCases,
+  createTestCase,
+  deleteTestCase
+} = require('./testcase-store');
+const {
+  PROVIDERS,
+  PROVIDER_IDS,
+  createAiTestcaseService,
+  normalizeProvider,
+  providerInfo
+} = require('./ai-testcase-service');
 
 let server;
 let outputChannel;
 let applyTracker;
+let sidebarProvider;
+let aiTestcaseService;
 const socketClients = new Set();
+const problemLocks = new Map();
 
 const EXTENSIONS = {
   c: 'c', cpp: 'cpp', 'c++': 'cpp', java: 'java', python: 'py', python3: 'py',
@@ -45,6 +66,32 @@ function config() {
   return { port: values.get('port'), outputDirectory: values.get('outputDirectory'), open: values.get('openSolutionAfterCapture') };
 }
 
+function aiConfig() {
+  const values = vscode.workspace.getConfiguration('leetcodeCph');
+  const provider = normalizeProvider(values.get('ai.provider') || 'glm');
+  return { provider, model: String(values.get('ai.model') || '').trim() };
+}
+
+// Capture requests and sidebar mutations can arrive independently.  Serialize
+// every read-modify-write operation for one problem directory so a quick
+// double-click, an AI rollback, or a re-capture cannot overwrite another
+// operation's testcases.json or testcase.* file.
+function withProblemLock(problemFolder, operation) {
+  const key = path.resolve(problemFolder);
+  const previous = problemLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  problemLocks.set(key, current);
+  return previous.catch(() => {}).then(async () => {
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (problemLocks.get(key) === current) problemLocks.delete(key);
+    }
+  });
+}
+
 function validPayload(value) {
   return value && typeof value === 'object' && typeof value.title === 'string' && value.title.trim()
     && typeof value.source === 'string' && typeof value.code === 'string';
@@ -63,15 +110,39 @@ async function saveCapture(payload) {
   const metadata = path.join(folder, 'metadata.json');
   await fs.mkdir(folder, { recursive: true });
 
-  const markdown = `# ${payload.title}\n\n- Source: ${payload.source}\n- Captured: ${payload.capturedAt || new Date().toISOString()}\n- Language: ${payload.language || 'unknown'}\n\n## Problem\n\n${payload.description || '_题面未能从页面读取；可从 Source 链接查看。'}\n\n${payload.samples ? `## Examples\n\n${payload.samples}\n` : ''}`;
-  await Promise.all([
-    fs.writeFile(solution, payload.code, 'utf8'),
-    fs.writeFile(readme, markdown, 'utf8'),
-    fs.writeFile(metadata, JSON.stringify({ ...payload, savedAt: new Date().toISOString() }, null, 2), 'utf8')
-  ]);
+  const saved = await withProblemLock(folder, async () => {
+    // Re-capturing a page refreshes examples visible on LeetCode while retaining
+    // every case the user added manually in the sidebar (and any explicit
+    // deletion tombstone for a captured example).
+    let previousMetadata = {};
+    try { previousMetadata = JSON.parse(await readTextIfPresent(metadata)); } catch (_) { /* A fresh/corrupt legacy metadata file is replaced below. */ }
+    const hasStoredTestCases = await fileExists(path.join(folder, TEST_CASES_FILE));
+    let previousState = await loadTestCaseState(folder);
+    if (!hasStoredTestCases) {
+      // A user can upgrade from an older capture and immediately re-capture
+      // while LeetCode is still loading.  Seed the merge from old metadata so
+      // that transient empty samples do not erase that legacy information.
+      previousState = { ...previousState, testCases: fromCapturePayload(previousMetadata) };
+    }
+    const testCases = mergeCaptureTestCases(previousState.testCases, payload, {
+      excludedLeetCodeIds: previousState.excludedLeetCodeIds
+    });
+    const testCasesChanged = JSON.stringify(previousState.testCases) !== JSON.stringify(testCases);
+    const scaffold = path.join(folder, `testcase.${extension}`);
+    const hasScaffold = await fileExists(scaffold);
+    const scaffoldStale = hasScaffold && (Boolean(previousMetadata.testcaseScaffoldStale) || testCasesChanged);
+    const markdown = `# ${payload.title}\n\n- Source: ${payload.source}\n- Captured: ${payload.capturedAt || new Date().toISOString()}\n- Language: ${payload.language || 'unknown'}\n\n## Problem\n\n${payload.description || '_题面未能从页面读取；可从 Source 链接查看。'}\n\n${payload.samples ? `## Examples\n\n${payload.samples}\n` : ''}`;
+    await Promise.all([
+      fs.writeFile(solution, payload.code, 'utf8'),
+      fs.writeFile(readme, markdown, 'utf8'),
+      fs.writeFile(metadata, JSON.stringify({ ...payload, savedAt: new Date().toISOString(), testcaseScaffoldStale: scaffoldStale }, null, 2), 'utf8'),
+      saveTestCases(folder, testCases, { excludedLeetCodeIds: previousState.excludedLeetCodeIds })
+    ]);
+    return { folder: path.relative(root, folder), solution, scaffoldStale };
+  });
   outputChannel.appendLine(`Saved ${payload.title} → ${folder}`);
   if (settings.open) await vscode.window.showTextDocument(vscode.Uri.file(solution), { preview: false });
-  return { folder: path.relative(root, folder), solution };
+  return saved;
 }
 
 function respond(response, status, body) {
@@ -223,40 +294,364 @@ function requestBrowserApply(payload) {
   });
 }
 
-async function currentSolution() {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document.uri.scheme !== 'file') throw new Error('请先打开需要同步的 solution 文件。');
-  const filePath = editor.document.uri.fsPath;
-  if (!/^solution\.[^.]+$/i.test(path.basename(filePath))) {
-    throw new Error('仅能同步题目目录中的 solution.* 文件。');
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
   }
+}
+
+async function readTextIfPresent(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function writeTextAtomically(filePath, content) {
+  const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${String(content).replace(/\r?\n?$/, '')}\n`, 'utf8');
+    await fs.rename(temporary, filePath);
+  } finally {
+    await fs.unlink(temporary).catch(() => {});
+  }
+}
+
+async function loadOrMigrateTestCases(problemFolder, metadata) {
+  const storageFile = path.join(problemFolder, TEST_CASES_FILE);
+  const exists = await fileExists(storageFile);
+  const saved = await loadTestCases(problemFolder);
+  if (exists) return saved;
+
+  // Existing captures created before testcases.json remain usable immediately.
+  // This read path deliberately does not write: a sidebar refresh must not
+  // race a capture or mutation.  A mutating operation persists the migration
+  // while it holds the per-problem lock.
+  const migrated = fromCapturePayload(metadata);
+  return migrated;
+}
+
+function pathKey(filePath) {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function openTextDocument(filePath) {
+  const target = pathKey(filePath);
+  const documents = Array.isArray(vscode.workspace.textDocuments) ? vscode.workspace.textDocuments : [];
+  return documents.find((document) => document?.uri?.scheme === 'file'
+    && typeof document.uri.fsPath === 'string'
+    && pathKey(document.uri.fsPath) === target);
+}
+
+async function readOpenDocumentOrFile(filePath) {
+  const document = openTextDocument(filePath);
+  return document ? document.getText() : fs.readFile(filePath, 'utf8');
+}
+
+async function findSolutionFile(problemFolder, preferredExtension) {
+  const preferred = path.join(problemFolder, `solution${preferredExtension}`);
+  if (await fileExists(preferred)) return preferred;
+  const entries = await fs.readdir(problemFolder, { withFileTypes: true });
+  const candidates = entries
+    .filter((entry) => entry.isFile() && /^solution\.[^.]+$/i.test(entry.name))
+    .map((entry) => path.join(problemFolder, entry.name));
+  if (candidates.length === 1) return candidates[0];
+  throw new Error('未找到同目录的 solution.* 文件，无法读取被测代码。');
+}
+
+async function activeProblemIdentity({ required = true } = {}) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.scheme !== 'file') {
+    if (!required) return null;
+    throw new Error('请先打开题目目录中的 solution.* 或 testcase.* 文件。');
+  }
+  const activeFilePath = editor.document.uri.fsPath;
+  const activeName = path.basename(activeFilePath);
+  const isSolution = /^solution\.[^.]+$/i.test(activeName);
+  const isScaffold = /^testcase\.[^.]+$/i.test(activeName);
+  if (!isSolution && !isScaffold) {
+    if (!required) return null;
+    throw new Error('仅能在题目目录中的 solution.* 或 testcase.* 文件打开时使用此功能。');
+  }
+  const folder = path.dirname(activeFilePath);
+  const solutionPath = isSolution
+    ? activeFilePath
+    : await findSolutionFile(folder, path.extname(activeFilePath));
+  const code = isSolution ? editor.document.getText() : await readOpenDocumentOrFile(solutionPath);
+  return {
+    folder,
+    solutionPath,
+    solutionFileName: path.basename(solutionPath),
+    activeFilePath,
+    code
+  };
+}
+
+async function problemContextFromIdentity(identity) {
   let metadata;
   try {
-    metadata = JSON.parse(await fs.readFile(path.join(path.dirname(filePath), 'metadata.json'), 'utf8'));
+    metadata = JSON.parse(await fs.readFile(path.join(identity.folder, 'metadata.json'), 'utf8'));
   } catch (_) {
     throw new Error('未找到同目录的 metadata.json，无法确定对应力扣题目。');
   }
   if (!metadata?.source) throw new Error('metadata.json 中缺少题目来源链接。');
+  const testCases = await loadOrMigrateTestCases(identity.folder, metadata);
   return {
+    ...identity,
+    metadata,
+    title: metadata.title || path.basename(identity.folder),
     source: metadata.source,
-    title: metadata.title || path.basename(path.dirname(filePath)),
-    language: metadata.language || path.extname(filePath).slice(1),
-    code: editor.document.getText()
+    language: metadata.language || path.extname(identity.solutionPath).slice(1),
+    testCases
   };
 }
 
-async function syncCurrentSolution() {
-  try {
-    const payload = await currentSolution();
-    vscode.window.setStatusBarMessage('LeetCode CPH: 正在同步到浏览器…');
-    const result = await requestBrowserApply(payload);
-    const extra = result.duplicates ? `（另有 ${result.duplicates} 个同题标签未修改）` : '';
-    vscode.window.setStatusBarMessage(`LeetCode CPH: 已同步到浏览器 ${extra}`, 5000);
-    outputChannel.appendLine(`Synced ${payload.title} to tab ${result.tabId}.`);
-  } catch (error) {
-    vscode.window.showErrorMessage(`LeetCode CPH 同步失败：${error.message || error}`);
-    outputChannel.appendLine(`Sync failed: ${error.stack || error.message}`);
+async function activeProblemContext(options = {}) {
+  const identity = await activeProblemIdentity(options);
+  return identity ? problemContextFromIdentity(identity) : null;
+}
+
+function browserApplyPayload(context) {
+  return {
+    source: context.source,
+    title: context.title,
+    language: context.language,
+    code: context.code
+  };
+}
+
+function scaffoldFilePath(context) {
+  const extension = path.extname(context.solutionPath).slice(1) || languageExtension(context.language);
+  return path.join(context.folder, `testcase.${extension}`);
+}
+
+async function ensurePersistedTestCases(context) {
+  const storageFile = path.join(context.folder, TEST_CASES_FILE);
+  if (await fileExists(storageFile)) return context;
+  const testCases = await saveTestCases(context.folder, context.testCases);
+  return { ...context, testCases };
+}
+
+async function markScaffoldFresh(context) {
+  if (!context.metadata?.testcaseScaffoldStale) return;
+  const metadataPath = path.join(context.folder, 'metadata.json');
+  const nextMetadata = { ...context.metadata, testcaseScaffoldStale: false };
+  await writeTextAtomically(metadataPath, JSON.stringify(nextMetadata, null, 2));
+  context.metadata = nextMetadata;
+}
+
+async function configuredAiState() {
+  if (!aiTestcaseService) return { provider: 'glm', model: '', configured: false };
+  const { provider, model } = aiConfig();
+  const configuredProviders = await aiTestcaseService.getConfiguredProviders();
+  return { provider, model, configured: Boolean(configuredProviders[provider]), configuredProviders };
+}
+
+async function generateTestScaffold(context, testCases, operation) {
+  if (!aiTestcaseService) throw new Error('AI 服务尚未初始化，请重新加载 VS Code 扩展。');
+  if (!Array.isArray(testCases)) {
+    throw new Error('测试用例数据无效，无法生成测试脚手架。');
   }
+  if (operation?.type === 'initialize' && !testCases.length) {
+    throw new Error('当前没有测试用例，无法生成测试脚手架。');
+  }
+  const ai = await configuredAiState();
+  if (!ai.configured) {
+    const label = providerInfo(ai.provider).label;
+    throw new Error(`未配置 ${label} API Key。请在侧边栏点击“配置 AI”后保存密钥。`);
+  }
+  const destination = scaffoldFilePath(context);
+  const openScaffold = openTextDocument(destination);
+  if (openScaffold?.isDirty) {
+    throw new Error(`请先保存 ${path.basename(destination)} 中的手动编辑，再更新测试脚手架。`);
+  }
+  const existingScaffold = openScaffold ? openScaffold.getText() : await readTextIfPresent(destination);
+  const generated = await aiTestcaseService.generateScaffold({
+    metadata: context.metadata,
+    solutionCode: context.code,
+    testCases,
+    operation,
+    existingScaffold,
+    provider: ai.provider,
+    model: ai.model
+  });
+  await writeTextAtomically(destination, generated.content);
+  try {
+    await markScaffoldFresh(context);
+  } catch (error) {
+    // The scaffold itself was written successfully.  Leaving the stale badge
+    // visible is safer than reporting the entire mutation as failed and
+    // rolling back its testcase JSON after the source file changed.
+    outputChannel?.appendLine(`Could not clear testcase scaffold stale marker: ${error.message}`);
+  }
+  return { ...generated, destination };
+}
+
+async function syncActiveSolution() {
+  const context = await activeProblemContext();
+  vscode.window.setStatusBarMessage('LeetCode CPH: 正在同步到浏览器…');
+  const result = await requestBrowserApply(browserApplyPayload(context));
+  const extra = result.duplicates ? `（另有 ${result.duplicates} 个同题标签未修改）` : '';
+  vscode.window.setStatusBarMessage(`LeetCode CPH: 已同步到浏览器 ${extra}`, 5000);
+  outputChannel.appendLine(`Synced ${context.title} to tab ${result.tabId}.`);
+  return result;
+}
+
+async function sidebarState(extra = {}) {
+  const empty = { problem: null, testCases: [], busy: false, notice: '', error: '' };
+  let context;
+  try {
+    context = await activeProblemContext({ required: false });
+  } catch (error) {
+    return { ...empty, ...extra, error: extra.error || error.message || '无法读取当前题目。' };
+  }
+  if (!context) return { ...empty, ...extra };
+
+  let aiStatus = 'AI：未初始化';
+  try {
+    const ai = await configuredAiState();
+    const label = providerInfo(ai.provider).label;
+    aiStatus = `AI：${label}${ai.configured ? '（API Key 已安全保存）' : '（未配置 API Key）'}`;
+  } catch (error) {
+    aiStatus = 'AI：配置无效';
+  }
+  return {
+    ...empty,
+    problem: {
+      title: context.title,
+      source: context.source,
+      language: context.language,
+      aiStatus,
+      scaffoldStatus: context.metadata?.testcaseScaffoldStale ? '测试脚手架需要更新' : ''
+    },
+    testCases: context.testCases,
+    ...extra
+  };
+}
+
+async function refreshSidebar(extra = {}) {
+  const state = await sidebarState(extra);
+  sidebarProvider?.setState(state);
+  return state;
+}
+
+async function configureAi() {
+  if (!aiTestcaseService) throw new Error('VS Code SecretStorage 不可用，无法安全保存 API Key。');
+  const configured = await aiTestcaseService.getConfiguredProviders();
+  const selectedConfig = aiConfig();
+  const provider = await vscode.window.showQuickPick(
+    PROVIDER_IDS.map((id) => ({
+      label: providerInfo(id).label,
+      description: configured[id] ? 'API Key 已安全保存' : '未配置 API Key',
+      detail: PROVIDERS[id].defaultModel,
+      id
+    })),
+    { placeHolder: '选择用于生成 LeetCode 测试脚手架的 AI Provider', ignoreFocusOut: true }
+  );
+  if (!provider) return null;
+
+  const defaultModel = provider.id === selectedConfig.provider && selectedConfig.model
+    ? selectedConfig.model
+    : PROVIDERS[provider.id].defaultModel;
+  const model = await vscode.window.showInputBox({
+    prompt: `${provider.label} 模型名称（可保留默认值）`,
+    value: defaultModel,
+    ignoreFocusOut: true
+  });
+  if (model === undefined) return null;
+  const apiKey = await vscode.window.showInputBox({
+    prompt: `输入 ${provider.label} API Key（仅安全保存于 VS Code SecretStorage）`,
+    password: true,
+    ignoreFocusOut: true,
+    validateInput: (value) => value.trim() ? undefined : 'API Key 不能为空。'
+  });
+  if (apiKey === undefined) return null;
+
+  await aiTestcaseService.saveApiKey(provider.id, apiKey);
+  const configuration = vscode.workspace.getConfiguration('leetcodeCph');
+  await configuration.update('ai.provider', provider.id, vscode.ConfigurationTarget.Global);
+  await configuration.update('ai.model', model.trim(), vscode.ConfigurationTarget.Global);
+  return { provider: provider.id, model: model.trim() || PROVIDERS[provider.id].defaultModel };
+}
+
+async function mutateTestCaseAndScaffold(type, payload) {
+  const identity = await activeProblemIdentity();
+  return withProblemLock(identity.folder, async () => {
+    let context = await problemContextFromIdentity(identity);
+    const ai = await configuredAiState();
+    if (!ai.configured) {
+      throw new Error(`未配置 ${providerInfo(ai.provider).label} API Key。请先点击“配置 AI”。`);
+    }
+    // Persist a one-time legacy metadata migration only while holding the
+    // same lock as create/delete/capture, then snapshot both cases and
+    // deletion tombstones for an exact rollback if AI generation fails.
+    context = await ensurePersistedTestCases(context);
+    const previousState = await loadTestCaseState(context.folder);
+    context = { ...context, testCases: previousState.testCases };
+    let changed;
+    if (type === 'add') {
+      changed = await createTestCase(context.folder, payload);
+    } else if (type === 'delete') {
+      changed = await deleteTestCase(context.folder, payload?.id);
+    } else {
+      throw new Error('未知的测试用例操作。');
+    }
+
+    const affected = type === 'add' ? changed.testCase : changed.deleted;
+    try {
+      const generated = await generateTestScaffold(context, changed.testCases, { type, testCase: affected });
+      return { ...changed, generated };
+    } catch (error) {
+      // The testcase store writes before the remote AI call. Restore the exact
+      // prior state (including LeetCode-deletion tombstones) when the call or
+      // scaffold write fails, keeping local JSON and generated code in sync.
+      await saveTestCases(context.folder, previousState.testCases, {
+        excludedLeetCodeIds: previousState.excludedLeetCodeIds
+      });
+      throw error;
+    }
+  });
+}
+
+async function runSidebarAction(startMessage, action, successMessage) {
+  sidebarProvider?.setState({ busy: true, notice: startMessage, error: '' });
+  try {
+    const result = await action();
+    return refreshSidebar({ busy: false, notice: typeof successMessage === 'function' ? successMessage(result) : successMessage, error: '' });
+  } catch (error) {
+    const message = error?.message || '操作失败，请稍后重试。';
+    outputChannel?.appendLine(`Sidebar action failed: ${error?.stack || message}`);
+    return refreshSidebar({ busy: false, notice: '', error: message });
+  }
+}
+
+function createSidebar() {
+  return new LeetCodeCphSidebarProvider({
+    onReady: () => refreshSidebar(),
+    onAdd: (payload) => runSidebarAction('正在调用 AI 更新测试脚手架…', () => mutateTestCaseAndScaffold('add', payload), (result) => `已新增 ${result.testCase.name}，并更新 ${path.basename(result.generated.destination)}。`),
+    onDelete: (payload) => runSidebarAction('正在调用 AI 更新测试脚手架…', () => mutateTestCaseAndScaffold('delete', payload), (result) => `已删除 ${result.deleted.name}，并更新 ${path.basename(result.generated.destination)}。`),
+    onGenerateScaffold: () => runSidebarAction('正在生成测试脚手架…', async () => {
+      const identity = await activeProblemIdentity();
+      return withProblemLock(identity.folder, async () => {
+        const context = await problemContextFromIdentity(identity);
+        const generated = await generateTestScaffold(context, context.testCases, { type: 'initialize' });
+        return { generated };
+      });
+    }, (result) => `已生成 ${path.basename(result.generated.destination)}。`),
+    onSync: () => runSidebarAction('正在同步代码到 LeetCode…', () => syncActiveSolution(), (result) => result.duplicates ? `已同步到 LeetCode；另有 ${result.duplicates} 个同题标签未修改。` : '已同步代码到 LeetCode。'),
+    onConfigure: () => runSidebarAction('正在配置 AI…', () => configureAi(), (result) => result ? `${providerInfo(result.provider).label} API Key 已安全保存。` : '已取消 AI 配置。'),
+    onBugReport: () => runSidebarAction('正在打开 GitHub…', async () => {
+      await vscode.env.openExternal(vscode.Uri.parse('https://github.com/dd1000001000/simple-leetcode-cph'));
+      return {};
+    }, '已打开 GitHub 仓库。')
+  });
 }
 
 function startServer() {
@@ -277,6 +672,10 @@ function startServer() {
         const saved = await saveCapture(payload);
         respond(response, 200, { ok: true, ...saved });
         vscode.window.setStatusBarMessage(`LeetCode CPH: 已保存 ${payload.title}`, 5000);
+        const notice = saved.scaffoldStale
+          ? `已保存 ${payload.title}；LeetCode 样例已变化，请更新测试脚手架。`
+          : `已保存 ${payload.title} 的题目与测试用例。`;
+        void refreshSidebar({ notice, error: '' });
       } catch (error) {
         outputChannel.appendLine(`Capture failed: ${error.stack || error.message}`);
         respond(response, 400, { ok: false, error: error.message || '保存失败。' });
@@ -294,9 +693,30 @@ function startServer() {
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('LeetCode CPH Receiver');
   applyTracker = new ApplyTracker({ log: (line) => outputChannel.appendLine(line) });
+  // API keys are deliberately held only by VS Code SecretStorage.  Unit-test
+  // sandboxes may omit it, but a real ExtensionContext always provides it.
+  aiTestcaseService = context.secrets ? createAiTestcaseService({ secrets: context.secrets }) : undefined;
+  sidebarProvider = createSidebar();
   startServer();
   heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
-  context.subscriptions.push(outputChannel, { dispose: () => { clearInterval(heartbeatTimer); server?.close(); } });
+  context.subscriptions.push(outputChannel, sidebarProvider, { dispose: () => { clearInterval(heartbeatTimer); server?.close(); } });
+  if (typeof vscode.window.registerWebviewViewProvider === 'function') {
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider(
+      LeetCodeCphSidebarProvider.viewType,
+      sidebarProvider,
+      { webviewOptions: { retainContextWhenHidden: true } }
+    ));
+  }
+  if (typeof vscode.window.onDidChangeActiveTextEditor === 'function') {
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => { void refreshSidebar(); }));
+  }
+  if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('leetcodeCph.ai') || event.affectsConfiguration('leetcodeCph.outputDirectory')) {
+        void refreshSidebar();
+      }
+    }));
+  }
   context.subscriptions.push(vscode.commands.registerCommand('leetcodeCph.openOutputFolder', async () => {
     const root = workspaceRoot();
     if (!root) return vscode.window.showWarningMessage('请先打开一个工作区文件夹。');
@@ -305,12 +725,15 @@ function activate(context) {
     await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
   }));
   context.subscriptions.push(vscode.commands.registerCommand('leetcodeCph.showStatus', () => outputChannel.show()));
-  context.subscriptions.push(vscode.commands.registerCommand('leetcodeCph.sendCurrentSolution', syncCurrentSolution));
+  void refreshSidebar();
 }
 
 function deactivate() {
   clearInterval(heartbeatTimer);
   applyTracker?.disposeAll('VS Code 扩展已停止。');
+  sidebarProvider?.dispose();
+  sidebarProvider = undefined;
+  aiTestcaseService = undefined;
   for (const client of socketClients) client.socket.destroy();
   return new Promise((resolve) => server?.close(resolve) || resolve());
 }
