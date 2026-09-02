@@ -25,7 +25,7 @@ const PROVIDERS = Object.freeze({
     endpoint: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     // Keep the default on the broadly available, documented stable model.
     // Users who have access to another GLM variant can select it explicitly.
-    defaultModel: 'glm-5.1'
+    defaultModel: 'glm-5.2'
   }),
   deepseek: Object.freeze({
     id: 'deepseek',
