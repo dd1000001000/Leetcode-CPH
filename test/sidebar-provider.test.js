@@ -37,12 +37,17 @@ function makeView() {
 test('sidebar provider renders a CSP-protected testcase UI', () => {
   const html = getWebviewHtml('nonce-for-test');
   assert.match(html, /Content-Security-Policy/);
-  assert.match(html, /新增测试用例/);
-  assert.match(html, /生成\/更新测试脚手架/);
+  assert.match(html, /\+新增测试用例/);
+  assert.doesNotMatch(html, /id="case-input"/);
+  assert.doesNotMatch(html, /id="case-output"/);
+  assert.match(html, /保存并更新/);
+  assert.doesNotMatch(html, /生成\/更新测试脚手架/);
+  assert.match(html, /运行全部测试用例/);
+  assert.match(html, /实际输出/);
+  assert.match(html, /差异（预期 \/ 实际）/);
   assert.match(html, /同步代码到 LeetCode/);
   assert.match(html, /配置 AI/);
   assert.match(html, /反馈 Bug/);
-  assert.doesNotMatch(html, /运行全部/);
 });
 
 test('sidebar provider forwards manual testcase and sidebar actions', async () => {
@@ -50,8 +55,10 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
   const provider = new LeetCodeCphSidebarProvider({
     onReady: () => calls.push(['ready']),
     onAdd: (payload) => calls.push(['add', payload]),
+    onUpdate: (payload) => calls.push(['update', payload]),
     onDelete: (payload) => calls.push(['delete', payload]),
-    onGenerateScaffold: () => calls.push(['generate']),
+    onRunTestCase: (payload) => calls.push(['run', payload]),
+    onRunAllTestCases: () => calls.push(['run-all']),
     onSync: () => calls.push(['sync']),
     onConfigure: () => calls.push(['configure']),
     onBugReport: () => calls.push(['bug'])
@@ -65,17 +72,21 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
 
   await view.send({ type: 'ready' });
   await view.send({ type: 'addTestCase', input: '1', expectedOutput: '1' });
+  await view.send({ type: 'updateTestCase', id: 7, input: '2', expectedOutput: '4' });
   await view.send({ type: 'deleteTestCase', id: 7 });
-  await view.send({ type: 'generateScaffold' });
+  await view.send({ type: 'runTestCase', id: 'tc-1' });
+  await view.send({ type: 'runAllTestCases' });
   await view.send({ type: 'sync' });
   await view.send({ type: 'configureAI' });
   await view.send({ type: 'openBugReport' });
 
   assert.deepEqual(calls, [
     ['ready'],
-    ['add', { input: '1', expectedOutput: '1' }],
+    ['add', {}],
+    ['update', { id: '7', input: '2', expectedOutput: '4' }],
     ['delete', { id: '7' }],
-    ['generate'],
+    ['run', { id: 'tc-1' }],
+    ['run-all'],
     ['sync'],
     ['configure'],
     ['bug']
@@ -110,11 +121,11 @@ test('sidebar ignores a duplicate action while the first action is still pending
   });
   const view = makeView();
   provider.resolveWebviewView(view);
-  const first = view.send({ type: 'addTestCase', input: '1', expectedOutput: '1' });
+  const first = view.send({ type: 'addTestCase' });
   await Promise.resolve();
-  const duplicate = view.send({ type: 'addTestCase', input: '2', expectedOutput: '2' });
+  const duplicate = view.send({ type: 'addTestCase' });
   release();
   await Promise.all([first, duplicate]);
-  assert.deepEqual(calls, [{ input: '1', expectedOutput: '1' }]);
+  assert.deepEqual(calls, [{}]);
   provider.dispose();
 });

@@ -60,6 +60,7 @@ function createSandbox() {
       if (name === './sidebar-provider') return require('../vscode-extension/sidebar-provider');
       if (name === './testcase-store') return require('../vscode-extension/testcase-store');
       if (name === './ai-testcase-service') return require('../vscode-extension/ai-testcase-service');
+      if (name === './testcase-runner') return require('../vscode-extension/testcase-runner');
       throw new Error(`Unexpected require: ${name}`);
     }
   };

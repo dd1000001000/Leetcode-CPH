@@ -65,59 +65,6 @@
     return matched ? matched[0] : '';
   }
 
-  function testcaseName(index) {
-    return `testcase ${String(index + 1).padStart(3, '0')}`;
-  }
-
-  // LeetCode renders examples as <pre> blocks on most pages.  Their exact
-  // surrounding markup changes fairly often, but the Input/Output labels are
-  // stable in both the Chinese and English sites.  Keep the values as text:
-  // the VS Code extension deliberately lets the selected AI turn those
-  // language-neutral values into a language-specific test scaffold later.
-  function testCasesFromSamples(value) {
-    const source = clean(String(value || ''));
-    if (!source) return [];
-
-    const inputMarker = /(?:^|\n)\s*(?:Input|输入)\s*[：:]\s*/gim;
-    const outputMarker = /(?:^|\n)\s*(?:Output|输出)\s*[：:]\s*/gim;
-    // Stop the expected output before prose that belongs to the example, or
-    // before the next example.  The labels intentionally include the common
-    // English and Chinese variants used by LeetCode.
-    const outputEndMarker = /(?:^|\n)\s*(?:(?:Explanation|Constraints?|Follow[- ]?up|Notes?|Note|Example)\b|(?:解释|约束条件|提示|进阶|注意|示例)\s*[：:]|(?:Input|输入)\s*[：:])/gim;
-    const inputMatches = [...source.matchAll(inputMarker)];
-    const cases = [];
-
-    for (let index = 0; index < inputMatches.length; index += 1) {
-      const inputMatch = inputMatches[index];
-      const inputStart = inputMatch.index + inputMatch[0].length;
-      const nextInputStart = index + 1 < inputMatches.length ? inputMatches[index + 1].index : source.length;
-      outputMarker.lastIndex = inputStart;
-      const outputMatch = outputMarker.exec(source);
-      if (!outputMatch || outputMatch.index >= nextInputStart) continue;
-
-      const outputStart = outputMatch.index + outputMatch[0].length;
-      outputEndMarker.lastIndex = outputStart;
-      const outputEndMatch = outputEndMarker.exec(source);
-      const outputEnd = outputEndMatch && outputEndMatch.index < nextInputStart
-        ? outputEndMatch.index
-        : nextInputStart;
-      const input = clean(source.slice(inputStart, outputMatch.index));
-      const expectedOutput = clean(source.slice(outputStart, outputEnd));
-      if (!input && !expectedOutput) continue;
-      cases.push({
-        name: testcaseName(cases.length),
-        input,
-        expectedOutput,
-        source: 'leetcode'
-      });
-    }
-    return cases;
-  }
-
-  function testCases(problemText) {
-    return testCasesFromSamples(samples(problemText));
-  }
-
   function editorModel() {
     try {
       const models = window.monaco?.editor?.getModels?.() || [];
@@ -221,10 +168,9 @@
         problemId: problemId(problemTitle),
         description: problemText,
         samples: problemSamples,
-        // `samples` remains for backward compatibility and README rendering.
-        // `testCases` is the structured, editable source of truth used by the
-        // VS Code sidebar and testcase persistence layer.
-        testCases: testCasesFromSamples(problemSamples),
+        // Keep the examples as page context only.  The VS Code extension uses
+        // the user's configured AI provider to extract the editable testcase
+        // list; no brittle DOM regex result is treated as testcase data.
         code: code(),
         language: language(),
         capturedAt: new Date().toISOString()

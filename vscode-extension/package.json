@@ -2,7 +2,7 @@
   "name": "leetcode-cph-receiver",
   "displayName": "LeetCode CPH",
   "description": "Capture LeetCode problems, manage test cases in the sidebar, generate AI test scaffolds, and sync code back to the browser.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -39,7 +39,6 @@
     "configuration": {
       "title": "LeetCode CPH",
       "properties": {
-        "leetcodeCph.port": { "type": "number", "default": 27121, "minimum": 1024, "maximum": 65535, "description": "Local port used by the companion Edge extension." },
         "leetcodeCph.outputDirectory": { "type": "string", "default": "leetcode", "description": "Folder, relative to the current workspace, where captured problems are stored." },
         "leetcodeCph.openSolutionAfterCapture": { "type": "boolean", "default": true, "description": "Open the saved solution file after a capture arrives." },
         "leetcodeCph.ai.provider": {

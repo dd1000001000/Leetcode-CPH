@@ -8,8 +8,14 @@ const fs = require('fs/promises');
 const path = require('path');
 
 const TEST_CASES_FILE = 'testcases.json';
-const TEST_CASES_VERSION = 1;
+const TEST_CASES_VERSION = 3;
+// `leetcode` is retained only to recognize data saved by older extension
+// versions.  Those entries came from a brittle page regex and are never used
+// as a source for new automatic cases.
 const LEETCODE_SOURCE = 'leetcode';
+// `ai` means an explicit page example extracted by the user's configured LLM.
+// It is distinct from manual input and from legacy raw-DOM `leetcode` data.
+const AI_SOURCE = 'ai';
 const MANUAL_SOURCE = 'manual';
 const TEST_CASE_NAME_RE = /^testcase\s+(\d+)$/i;
 
@@ -30,8 +36,8 @@ function nowIso(now) {
 }
 
 function caseSource(value, fallback = MANUAL_SOURCE) {
-  if (value === LEETCODE_SOURCE || value === MANUAL_SOURCE) return value;
-  return fallback === LEETCODE_SOURCE ? LEETCODE_SOURCE : MANUAL_SOURCE;
+  if (value === LEETCODE_SOURCE || value === AI_SOURCE || value === MANUAL_SOURCE) return value;
+  return fallback === LEETCODE_SOURCE || fallback === AI_SOURCE ? fallback : MANUAL_SOURCE;
 }
 
 function testcaseName(number) {
@@ -48,18 +54,46 @@ function newId(source) {
   const suffix = typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : crypto.randomBytes(16).toString('hex');
-  return `${source === LEETCODE_SOURCE ? LEETCODE_SOURCE : MANUAL_SOURCE}-${suffix}`;
+  const prefix = source === AI_SOURCE ? AI_SOURCE : source === LEETCODE_SOURCE ? LEETCODE_SOURCE : MANUAL_SOURCE;
+  return `${prefix}-${suffix}`;
 }
 
-function captureId(payload, index, testCase) {
+function extractionProblemKey(payload) {
   // Do not include capturedAt or the site host: refreshing the same problem
   // through leetcode.com / leetcode.cn should preserve its captured identity.
   const source = text(payload?.problemUrl || payload?.source);
   const sourceSlug = source.match(/\/problems\/([^/?#]+)/i)?.[1] || '';
-  const problem = text(payload?.problemSlug || sourceSlug || source).toLowerCase();
-  const contents = `${problem}\u0000${contentText(testCase?.input)}\u0000${contentText(testCase?.expectedOutput ?? testCase?.output)}\u0000${index}`;
+  return text(payload?.problemSlug || sourceSlug || source).toLowerCase();
+}
+
+function hashedAiIdentity(kind, payload, parts) {
+  const contents = [extractionProblemKey(payload), kind, ...parts].join('\u0000');
   const digest = crypto.createHash('sha256').update(contents).digest('hex').slice(0, 16);
-  return `${LEETCODE_SOURCE}-${digest}`;
+  return `${AI_SOURCE}-${kind}-${digest}`;
+}
+
+function extractionId(payload, testCase) {
+  // Prefer the AI's verified verbatim evidence as identity. Parsing details
+  // (for example whitespace or a corrected output representation) can change
+  // while the page example is still the same. A deletion tombstone must keep
+  // suppressing that same source example after a later re-extraction.
+  const evidence = contentText(testCase?.evidence).replace(/\s+/g, ' ').trim();
+  // Old records/tests without evidence retain the content-based identity.
+  // The identity intentionally has no array position, so reordering examples
+  // cannot resurrect a testcase that the user explicitly removed.
+  if (evidence) return hashedAiIdentity('evidence', payload, [evidence]);
+  return contentExtractionId(payload, testCase);
+}
+
+// Evidence is the primary identity because an AI can correct whitespace or
+// formatting while referring to the exact same source excerpt.  Persist a
+// second content alias too: models may choose a longer/shorter valid evidence
+// span on the next extraction, and a deleted testcase must not reappear just
+// because that free-form span changed.
+function contentExtractionId(payload, testCase) {
+  const input = contentText(testCase?.input).replace(/\s+/g, ' ').trim();
+  const output = contentText(testCase?.expectedOutput ?? testCase?.output).replace(/\s+/g, ' ').trim();
+  return hashedAiIdentity('content', payload, [input, output]);
 }
 
 function uniqueId(preferred, source, usedIds, idFactory) {
@@ -107,13 +141,15 @@ function normalizeTestCases(values, options = {}) {
       fallbackNumber = Math.max(fallbackNumber, testcaseNumber(name) + 1);
       const id = uniqueId(value.id, source, usedIds, options.idFactory);
       usedIds.add(id);
+      const aiContentId = source === AI_SOURCE ? text(value.aiContentId) : '';
       return {
         id,
         name,
         input: contentText(value.input),
         expectedOutput: contentText(value.expectedOutput ?? value.output),
         source,
-        createdAt: text(value.createdAt) || createdAt
+        createdAt: text(value.createdAt) || createdAt,
+        ...(aiContentId ? { aiContentId } : {})
       };
     });
 }
@@ -169,80 +205,98 @@ function parseLeetCodeSamples(samples) {
 }
 
 /**
- * Convert a page-collector payload into canonical test cases.  New captures
- * send structured `testCases`; old metadata with only `samples` is migrated
- * automatically so users do not lose their existing problems.
+ * Convert JSON already validated by the AI service into the persisted testcase
+ * shape.  It deliberately never reads `payload.testCases` or `payload.samples`:
+ * those fields are raw page context, not a trustworthy testcase source.
  */
-function fromCapturePayload(payload, options = {}) {
-  // Some page layouts expose legacy samples even when the structured parser
-  // produces an empty array.  Prefer non-empty structured data, then recover
-  // from samples rather than silently treating a transient parser miss as
-  // proof that a problem has no examples.
-  const structured = Array.isArray(payload?.testCases) ? payload.testCases : [];
-  const raw = structured.length ? structured : parseLeetCodeSamples(payload?.samples);
+function fromAiExtraction(payload, extractedValues, options = {}) {
+  if (!Array.isArray(extractedValues)) return [];
   const capturedAt = text(payload?.capturedAt) || nowIso(options.now);
-  return normalizeTestCases(raw.map((testCase, index) => ({
-    ...testCase,
-    id: text(testCase?.id) || captureId(payload, index, testCase),
-    name: text(testCase?.name) || testcaseName(index + 1),
-    source: LEETCODE_SOURCE,
-    createdAt: text(testCase?.createdAt) || capturedAt
-  })), { ...options, defaultSource: LEETCODE_SOURCE });
+  return normalizeTestCases(extractedValues.map((testCase, index) => ({
+    input: contentText(testCase?.input),
+    expectedOutput: contentText(testCase?.expectedOutput ?? testCase?.output),
+    // A model is not allowed to select a persistent id, source, or testcase
+    // name.  The extension owns all three so mutations remain deterministic.
+    id: extractionId(payload, testCase),
+    aiContentId: contentExtractionId(payload, testCase),
+    name: testcaseName(index + 1),
+    source: AI_SOURCE,
+    createdAt: capturedAt
+  })), { ...options, defaultSource: AI_SOURCE });
 }
 
 /**
- * Replace the captured LeetCode portion of a testcase list while retaining
- * every manually-created case.  Matching captured cases keep their existing
- * id/name/createdAt first by stable capture id, then by their testcase number
- * (so a changed example in position 001 updates testcase 001 instead of
- * needlessly deleting and recreating its AI scaffold block).
- *
- * The function is pure: callers can review/generate a scaffold from its
- * result before persisting it with saveTestCases().
+ * Backwards-compatible entry point for callers that pass a capture payload.
+ * Only `aiTestCases` (written after a successful user-key-backed extraction)
+ * is accepted.  Legacy raw DOM `testCases` and `samples` are intentionally
+ * ignored, including during metadata migration.
  */
-function mergeCaptureTestCases(existingValues, payload, options = {}) {
+function fromCapturePayload(payload, options = {}) {
+  return fromAiExtraction(payload, payload?.aiTestCases, options);
+}
+
+/**
+ * Merge an AI extraction into the automatic portion of the testcase list.
+ * `extractedValues === undefined` means no AI request was made (for example,
+ * no key is configured), so existing AI cases remain but legacy raw-DOM cases
+ * are dropped.  An explicit empty array means the model found no examples and
+ * therefore replaces existing AI cases with zero automatic cases.
+ */
+function mergeAiExtractedTestCases(existingValues, payload, extractedValues, options = {}) {
   const existing = normalizeTestCases(existingValues, options);
-  const rawIncoming = fromCapturePayload(payload, options);
-  const excludedLeetCodeIds = new Set(normalizeExcludedLeetCodeIds(options.excludedLeetCodeIds));
-  const incoming = rawIncoming.filter((testCase) => !excludedLeetCodeIds.has(testCase.id));
   const manual = existing.filter((testCase) => testCase.source === MANUAL_SOURCE);
-  const oldCaptured = existing.filter((testCase) => testCase.source === LEETCODE_SOURCE);
+  const oldAi = existing.filter((testCase) => testCase.source === AI_SOURCE);
+  const excludedAiIds = new Set(normalizeExcludedAiIds(options.excludedAiIds));
 
-  // A capture with no recognizable Input/Output pair is normally a page
-  // layout/loading problem, not evidence that every previously displayed
-  // example disappeared.  Keep the last known captured cases in that state.
-  // If rawIncoming was non-empty but all of it was explicitly deleted by the
-  // user, we intentionally continue with an empty incoming list instead.
-  if (!rawIncoming.length && oldCaptured.length) return existing;
+  if (extractedValues === undefined) {
+    // Never keep legacy `leetcode` values here: they originated from page DOM
+    // parsing and must not reappear in the sidebar after this migration.
+    return [...oldAi, ...manual];
+  }
 
-  const oldById = new Map(oldCaptured.map((testCase) => [testCase.id, testCase]));
-  const oldByName = new Map(oldCaptured.map((testCase) => [testCase.name, testCase]));
+  // An empty model response is ambiguous: it can mean a problem truly has no
+  // examples, but it can also be a transient extraction miss. Preserve prior
+  // verified AI cases rather than silently deleting them. A fresh problem
+  // still stays empty, and callers may re-extract at any time.
+  if (!extractedValues.length && oldAi.length) return [...oldAi, ...manual];
+
+  const incoming = fromAiExtraction(payload, extractedValues, options)
+    .filter((testCase) => !excludedAiIds.has(testCase.id) && !excludedAiIds.has(testCase.aiContentId));
+  const oldById = new Map(oldAi.map((testCase) => [testCase.id, testCase]));
+  const oldByContentIdentity = new Map(oldAi
+    .filter((testCase) => testCase.aiContentId)
+    .map((testCase) => [testCase.aiContentId, testCase]));
+  const oldByName = new Map(oldAi.map((testCase) => [testCase.name, testCase]));
   const usedIds = new Set(manual.map((testCase) => testCase.id));
   const usedNumbers = new Set(manual.map((testCase) => testcaseNumber(testCase.name)).filter(Boolean));
   let fallbackNumber = 1;
 
-  const captured = incoming.map((incomingCase) => {
-    const previous = oldById.get(incomingCase.id) || oldByName.get(incomingCase.name);
-    const sourceId = previous?.id || incomingCase.id;
-    const id = uniqueId(sourceId, LEETCODE_SOURCE, usedIds, options.idFactory);
+  const extracted = incoming.map((incomingCase) => {
+    const previous = oldById.get(incomingCase.id)
+      || oldByContentIdentity.get(incomingCase.aiContentId)
+      || oldByName.get(incomingCase.name);
+    const id = uniqueId(previous?.id || incomingCase.id, AI_SOURCE, usedIds, options.idFactory);
     usedIds.add(id);
-    const preferredName = previous?.name || incomingCase.name;
-    const name = normalizedName(preferredName, usedNumbers, fallbackNumber);
+    const name = normalizedName(previous?.name || incomingCase.name, usedNumbers, fallbackNumber);
     fallbackNumber = Math.max(fallbackNumber, testcaseNumber(name) + 1);
     return {
       id,
       name,
       input: incomingCase.input,
       expectedOutput: incomingCase.expectedOutput,
-      source: LEETCODE_SOURCE,
-      createdAt: previous?.createdAt || incomingCase.createdAt
+      source: AI_SOURCE,
+      createdAt: previous?.createdAt || incomingCase.createdAt,
+      aiContentId: incomingCase.aiContentId
     };
   });
 
-  // Captured cases intentionally come first in UI order, followed by stable
-  // manual cases.  All IDs/names are unique at this point and no normalizer is
-  // invoked again (which could otherwise renumber a preserved manual case).
-  return [...captured, ...manual];
+  return [...extracted, ...manual];
+}
+
+// Retain the old export name while making the safe, AI-only behavior the
+// default for any caller that has not yet moved to the explicit helper.
+function mergeCaptureTestCases(existingValues, payload, options = {}) {
+  return mergeAiExtractedTestCases(existingValues, payload, payload?.aiTestCases, options);
 }
 
 function testCasesPath(problemFolder) {
@@ -252,9 +306,17 @@ function testCasesPath(problemFolder) {
   return path.join(problemFolder, TEST_CASES_FILE);
 }
 
-function normalizeExcludedLeetCodeIds(values) {
+function normalizeExcludedIds(values) {
   if (!Array.isArray(values)) return [];
   return [...new Set(values.map((value) => text(value)).filter(Boolean))];
+}
+
+function normalizeExcludedAiIds(values) {
+  return normalizeExcludedIds(values);
+}
+
+function normalizeExcludedLeetCodeIds(values) {
+  return normalizeExcludedIds(values);
 }
 
 async function loadTestCaseState(problemFolder, options = {}) {
@@ -263,7 +325,7 @@ async function loadTestCaseState(problemFolder, options = {}) {
   try {
     parsed = JSON.parse(await fs.readFile(file, 'utf8'));
   } catch (error) {
-    if (error?.code === 'ENOENT') return { testCases: [], excludedLeetCodeIds: [] };
+    if (error?.code === 'ENOENT') return { testCases: [], excludedAiIds: [], excludedLeetCodeIds: [] };
     if (error instanceof SyntaxError) {
       throw new Error(`无法读取 ${TEST_CASES_FILE}：文件不是有效 JSON。`);
     }
@@ -277,8 +339,10 @@ async function loadTestCaseState(problemFolder, options = {}) {
   }
   return {
     testCases: normalizeTestCases(values, options),
-    // Deleted LeetCode examples are tombstoned so a later page re-capture
-    // does not silently resurrect a test the user intentionally removed.
+    // AI-extracted cases are tombstoned so a later extraction does not silently
+    // resurrect a test the user intentionally removed.  Keep legacy tombstones
+    // solely to safely read older files.
+    excludedAiIds: normalizeExcludedAiIds(Array.isArray(parsed) ? [] : parsed?.excludedAiIds),
     excludedLeetCodeIds: normalizeExcludedLeetCodeIds(Array.isArray(parsed) ? [] : parsed?.excludedLeetCodeIds)
   };
 }
@@ -291,20 +355,18 @@ async function saveTestCases(problemFolder, values, options = {}) {
   const file = testCasesPath(problemFolder);
   const testCases = normalizeTestCases(values, options);
   // Callers that only replace visible cases should not accidentally erase
-  // capture-deletion tombstones.  Supplying the option explicitly allows the
-  // delete path to extend that list.
-  const existingState = Object.prototype.hasOwnProperty.call(options, 'excludedLeetCodeIds')
-    ? null
-    : await loadTestCaseState(problemFolder, options);
-  const excludedLeetCodeIds = normalizeExcludedLeetCodeIds(
-    Object.prototype.hasOwnProperty.call(options, 'excludedLeetCodeIds')
-      ? options.excludedLeetCodeIds
-      : existingState.excludedLeetCodeIds
-  );
+  // deletion tombstones.  Supplying a list explicitly allows the delete path
+  // to extend that list; the other list is still retained from disk.
+  const hasAiIds = Object.prototype.hasOwnProperty.call(options, 'excludedAiIds');
+  const hasLegacyIds = Object.prototype.hasOwnProperty.call(options, 'excludedLeetCodeIds');
+  const existingState = hasAiIds && hasLegacyIds ? null : await loadTestCaseState(problemFolder, options);
+  const excludedAiIds = normalizeExcludedAiIds(hasAiIds ? options.excludedAiIds : existingState.excludedAiIds);
+  const excludedLeetCodeIds = normalizeExcludedLeetCodeIds(hasLegacyIds ? options.excludedLeetCodeIds : existingState.excludedLeetCodeIds);
   const document = {
     version: TEST_CASES_VERSION,
     updatedAt: nowIso(options.now),
     testCases,
+    excludedAiIds,
     excludedLeetCodeIds
   };
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -322,9 +384,6 @@ async function saveTestCases(problemFolder, values, options = {}) {
 
 async function createTestCase(problemFolder, draft = {}, options = {}) {
   const values = draft && typeof draft === 'object' ? draft : {};
-  if (!contentText(values.input) && !contentText(values.expectedOutput ?? values.output)) {
-    throw new Error('请至少填写测试用例的输入或预期输出。');
-  }
   const state = await loadTestCaseState(problemFolder, options);
   const current = state.testCases;
   const testCase = normalizeTestCase({
@@ -348,9 +407,53 @@ async function createTestCase(problemFolder, draft = {}, options = {}) {
   }
   const testCases = await saveTestCases(problemFolder, [...current, testCase], {
     ...options,
+    excludedAiIds: state.excludedAiIds,
     excludedLeetCodeIds: state.excludedLeetCodeIds
   });
   return { testCase: testCases.find((item) => item.id === testCase.id), testCases };
+}
+
+/**
+ * Change editable test data without allowing a webview to alter testcase
+ * identity, ordering, or source metadata.  Editing an AI/legacy case makes it
+ * manual so a later automatic extraction cannot overwrite the user's work.
+ */
+async function updateTestCase(problemFolder, id, draft = {}, options = {}) {
+  const requestedId = text(id);
+  if (!requestedId) throw new Error('缺少要更新的测试用例 ID。');
+  if (!draft || typeof draft !== 'object') throw new TypeError('测试用例更新内容无效。');
+  const state = await loadTestCaseState(problemFolder, options);
+  const index = state.testCases.findIndex((testCase) => testCase.id === requestedId);
+  if (index < 0) throw new Error(`未找到测试用例：${requestedId}`);
+
+  const current = state.testCases[index];
+  const hasInput = Object.prototype.hasOwnProperty.call(draft, 'input');
+  const hasOutput = Object.prototype.hasOwnProperty.call(draft, 'expectedOutput') || Object.prototype.hasOwnProperty.call(draft, 'output');
+  if (hasInput && typeof draft.input !== 'string') throw new TypeError('测试用例输入必须是文本。');
+  const outputValue = Object.prototype.hasOwnProperty.call(draft, 'expectedOutput') ? draft.expectedOutput : draft.output;
+  if (hasOutput && typeof outputValue !== 'string') throw new TypeError('测试用例预期输出必须是文本。');
+
+  const next = {
+    ...current,
+    input: hasInput ? contentText(draft.input) : current.input,
+    expectedOutput: hasOutput ? contentText(outputValue) : current.expectedOutput,
+    source: MANUAL_SOURCE
+  };
+  // An edited AI case is now user-owned.  Tombstone its original automatic
+  // identities so an unchanged future extraction does not add a duplicate
+  // next to the edited manual testcase even if the model chooses a different
+  // valid evidence span next time.
+  const excludedAiIds = current.source === AI_SOURCE
+    ? normalizeExcludedAiIds([...state.excludedAiIds, current.id, current.aiContentId])
+    : state.excludedAiIds;
+  const values = [...state.testCases];
+  values[index] = next;
+  const testCases = await saveTestCases(problemFolder, values, {
+    ...options,
+    excludedAiIds,
+    excludedLeetCodeIds: state.excludedLeetCodeIds
+  });
+  return { previous: current, testCase: testCases.find((testCase) => testCase.id === requestedId), testCases };
 }
 
 async function deleteTestCase(problemFolder, id, options = {}) {
@@ -361,11 +464,15 @@ async function deleteTestCase(problemFolder, id, options = {}) {
   const index = current.findIndex((testCase) => testCase.id === requestedId);
   if (index < 0) throw new Error(`未找到测试用例：${requestedId}`);
   const [deleted] = current.splice(index, 1);
+  const excludedAiIds = deleted.source === AI_SOURCE
+    ? normalizeExcludedAiIds([...state.excludedAiIds, deleted.id, deleted.aiContentId])
+    : state.excludedAiIds;
   const excludedLeetCodeIds = deleted.source === LEETCODE_SOURCE
     ? normalizeExcludedLeetCodeIds([...state.excludedLeetCodeIds, deleted.id])
     : state.excludedLeetCodeIds;
   const testCases = await saveTestCases(problemFolder, current, {
     ...options,
+    excludedAiIds,
     excludedLeetCodeIds
   });
   return { deleted, testCases };
@@ -375,6 +482,7 @@ module.exports = {
   TEST_CASES_FILE,
   TEST_CASES_VERSION,
   LEETCODE_SOURCE,
+  AI_SOURCE,
   MANUAL_SOURCE,
   testcaseName,
   testcaseNumber,
@@ -382,12 +490,16 @@ module.exports = {
   normalizeTestCase,
   normalizeTestCases,
   parseLeetCodeSamples,
+  fromAiExtraction,
   fromCapturePayload,
+  mergeAiExtractedTestCases,
   mergeCaptureTestCases,
+  normalizeExcludedAiIds,
   normalizeExcludedLeetCodeIds,
   loadTestCaseState,
   loadTestCases,
   saveTestCases,
   createTestCase,
+  updateTestCase,
   deleteTestCase
 };

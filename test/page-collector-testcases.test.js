@@ -35,20 +35,19 @@ function collectFromPreBlocks(preBlocks) {
   return sandbox.window.__LEETCODE_CPH_COLLECT__();
 }
 
-test('page collector emits a structured testcase for every LeetCode example block', () => {
+test('page collector preserves raw examples as AI context but never emits parsed testcase data', () => {
   const payload = collectFromPreBlocks([
     'Example 1:\nInput: nums = [2,7,11,15], target = 9\nOutput: [0,1]\nExplanation: nums[0] + nums[1] == 9.',
     '示例 2：\n输入：nums = [3,2,4], target = 6\n输出：[1,2]\n解释：nums[1] + nums[2] == 6。'
   ]);
 
-  assert.equal(payload.samples.includes('Explanation'), true, 'raw samples are retained for README compatibility');
-  assert.deepEqual(JSON.parse(JSON.stringify(payload.testCases)), [
-    { name: 'testcase 001', input: 'nums = [2,7,11,15], target = 9', expectedOutput: '[0,1]', source: 'leetcode' },
-    { name: 'testcase 002', input: 'nums = [3,2,4], target = 6', expectedOutput: '[1,2]', source: 'leetcode' }
-  ]);
+  assert.match(payload.samples, /Explanation/);
+  assert.match(payload.samples, /示例 2/);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload, 'testCases'), false);
 });
 
-test('page collector has an empty structured list when a page has no examples', () => {
+test('page collector has no synthetic testcase list when a page has no examples', () => {
   const payload = collectFromPreBlocks([]);
-  assert.deepEqual(JSON.parse(JSON.stringify(payload.testCases)), []);
+  assert.equal(payload.samples, '');
+  assert.equal(Object.prototype.hasOwnProperty.call(payload, 'testCases'), false);
 });

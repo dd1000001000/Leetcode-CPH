@@ -8,6 +8,8 @@ const {
   createAiTestcaseService,
   getConfiguredProviders,
   secretKeyFor,
+  buildTestCaseExtractionPrompt,
+  parseExtractedTestCases,
   stripCodeFence,
   validateScaffold
 } = require('../vscode-extension/ai-testcase-service');
@@ -39,7 +41,17 @@ const testCases = [
 
 function successfulResponse() {
   return {
-    choices: [{ message: { content: '```python\n# testcase 001\ndef testcase_001(): pass\n# testcase 002\ndef testcase_002(): pass\n```' } }]
+    choices: [{ message: { content: [
+      '```python',
+      'import json',
+      'import sys',
+      "MARKER = '__LEETCODE_CPH_RESULT__'",
+      "selected = sys.argv[sys.argv.index('--case') + 1] if '--case' in sys.argv else None",
+      "for name in ['testcase 001', 'testcase 002']:",
+      '    if selected and name != selected: continue',
+      "    print(MARKER + json.dumps({'name': name, 'actual': '[0,1]', 'passed': True}))",
+      '```'
+    ].join('\n') } }]
   };
 }
 
@@ -89,6 +101,8 @@ test('generation sends the chosen provider request and returns fence-free scaffo
   assert.equal(received.body.temperature, 0);
   assert.match(received.body.messages[1].content, /testcase 001/);
   assert.match(received.body.messages[1].content, /testcase 002/);
+  assert.match(received.body.messages[1].content, /__LEETCODE_CPH_RESULT__/);
+  assert.match(received.body.messages[1].content, /--case/);
   assert.equal(result.content.includes('```'), false);
   assert.match(result.content, /testcase 001/);
   assert.match(result.content, /testcase 002/);
@@ -151,6 +165,71 @@ test('missing key fails before any request with actionable provider-specific gui
   assert.equal(called, false);
 });
 
+test('testcase extraction uses the selected user key and returns only validated JSON cases', async () => {
+  const apiKey = 'private-extraction-key';
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
+  let received;
+  const service = createAiTestcaseService({
+    secrets,
+    request: async (request) => {
+      received = request;
+      return {
+        choices: [{
+          finish_reason: 'stop',
+          message: {
+            content: '{"testCases":[{"input":"nums = [2,7,11,15], target = 9","expectedOutput":"[0,1]","evidence":"Input: nums = [2,7,11,15], target = 9\\nOutput: [0,1]"},{"input":"nums = [2,7,11,15], target = 9","expectedOutput":"[0,1]","evidence":"Input: nums = [2,7,11,15], target = 9\\nOutput: [0,1]"}]}'
+          }
+        }]
+      };
+    }
+  });
+
+  const result = await service.extractTestCases({
+    metadata: { ...metadata, samples: 'Example 1:\nInput: nums = [2,7,11,15], target = 9\nOutput: [0,1]' }
+  });
+
+  assert.equal(received.url, PROVIDERS.glm.endpoint);
+  assert.equal(received.headers.Authorization, `Bearer ${apiKey}`);
+  assert.equal(received.body.model, PROVIDERS.glm.defaultModel);
+  assert.match(received.body.messages[1].content, /Extract the explicit example test cases/);
+  assert.match(received.body.messages[1].content, /Example 1/);
+  assert.equal(received.body.messages[1].content.includes('solutionCode'), false);
+  assert.deepEqual(result, {
+    testCases: [{ input: 'nums = [2,7,11,15], target = 9', expectedOutput: '[0,1]', evidence: 'Input: nums = [2,7,11,15], target = 9\nOutput: [0,1]' }],
+    provider: 'glm',
+    model: PROVIDERS.glm.defaultModel
+  });
+  assert.equal(JSON.stringify(result).includes(apiKey), false);
+});
+
+test('testcase extraction has no raw-page fallback when the user has not configured a key', async () => {
+  let called = false;
+  const service = createAiTestcaseService({
+    secrets: makeSecrets(),
+    request: async () => { called = true; return successfulResponse(); }
+  });
+  await assert.rejects(
+    service.extractTestCases({ metadata: { ...metadata, samples: 'Input: n = 1\nOutput: 1' }, provider: 'qwen' }),
+    /未配置 Qwen API Key/
+  );
+  assert.equal(called, false);
+});
+
+test('testcase extraction prompt and JSON parser require verifiable page evidence', () => {
+  assert.match(buildTestCaseExtractionPrompt({ metadata: { ...metadata, samples: 'Input: n = 1\nOutput: 1' } }), /Do not invent/);
+  assert.match(buildTestCaseExtractionPrompt({ metadata: { ...metadata, samples: 'Input: n = 1\nOutput: 1' } }), /evidence/);
+  const extractionMetadata = { ...metadata, samples: 'Example 1:\nInput: n = 1\nOutput: 1' };
+  assert.deepEqual(
+    parseExtractedTestCases('```json\n{"testCases":[{"input":"n = 1","expectedOutput":"1","evidence":"Input: n = 1\\nOutput: 1"}]}\n```', extractionMetadata),
+    [{ input: 'n = 1', expectedOutput: '1', evidence: 'Input: n = 1\nOutput: 1' }]
+  );
+  assert.throws(() => parseExtractedTestCases('testcase 001 is ready', extractionMetadata), /不是有效 JSON/);
+  assert.throws(() => parseExtractedTestCases('{"testCases":[{"input":[],"expectedOutput":"1","evidence":"Input: n = 1\\nOutput: 1"}]}', extractionMetadata), /不是文本/);
+  assert.throws(() => parseExtractedTestCases('{"testCases":[{"input":"","expectedOutput":"","evidence":"Input: n = 1\\nOutput: 1"}]}', extractionMetadata), /均为空/);
+  assert.throws(() => parseExtractedTestCases('{"testCases":[{"input":"invented","expectedOutput":"1","evidence":"Input: n = 1\\nOutput: 1"}]}', extractionMetadata), /字段不在其题面证据中/);
+  assert.throws(() => parseExtractedTestCases('{"testCases":[{"input":"n = 1","expectedOutput":"1","evidence":"invented evidence"}]}', extractionMetadata), /证据不在题面中/);
+});
+
 test('provider response errors are useful but redact the API key', async () => {
   const apiKey = 'secret-that-must-not-appear';
   const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
@@ -176,13 +255,25 @@ test('provider response errors are useful but redact the API key', async () => {
 
 test('delete operation rejects an AI scaffold that still contains the deleted test name', async () => {
   const remaining = [testCases[0]];
+  const protocol = "\nMARKER = '__LEETCODE_CPH_RESULT__'\nselected = '--case'\nTEST_NAMES = ['testcase 001']\n";
   assert.throws(
-    () => validateScaffold('# testcase 001\ndef testcase_001(): pass\n# testcase 002\n', remaining, { type: 'delete', testCase: testCases[1] }, 'Python3'),
+    () => validateScaffold('# testcase 001\ndef testcase_001(): pass\n# testcase 002\n' + protocol, remaining, { type: 'delete', testCase: testCases[1] }, 'Python3'),
     /仍包含已删除的测试用例/
   );
   assert.equal(
-    validateScaffold('# testcase 001\ndef testcase_001(): pass\n', remaining, { type: 'delete', testCase: testCases[1] }, 'Python3'),
-    '# testcase 001\ndef testcase_001(): pass\n'
+    validateScaffold('# testcase 001\ndef testcase_001(): pass\n' + protocol, remaining, { type: 'delete', testCase: testCases[1] }, 'Python3'),
+    '# testcase 001\ndef testcase_001(): pass\n' + protocol
+  );
+});
+
+test('scaffold generation requires the per-case execution protocol', () => {
+  assert.throws(
+    () => validateScaffold('# testcase 001\ndef testcase_001(): pass\n', [testCases[0]], { type: 'initialize' }, 'Python3'),
+    /运行结果协议/
+  );
+  assert.throws(
+    () => validateScaffold('# testcase 001\n# --case\n# __LEETCODE_CPH_RESULT__\ndef noop(): pass\n', [testCases[0]], { type: 'initialize' }, 'Python3'),
+    /运行结果协议/
   );
 });
 
