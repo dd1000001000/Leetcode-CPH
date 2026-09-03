@@ -2,7 +2,7 @@
   "name": "leetcode-cph-receiver",
   "displayName": "LeetCode CPH",
   "description": "Capture LeetCode problems, manage test cases in the sidebar, generate AI test scaffolds, and sync code back to the browser.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {

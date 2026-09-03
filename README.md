@@ -46,13 +46,13 @@ If you already have a `.vsix` package:
 
 1. Open the **Extensions** view in VS Code.
 2. Select `...` and then **Install from VSIX...**.
-3. Choose `leetcode-cph-receiver-0.7.0.vsix` (or the newer package you built).
+3. Choose `leetcode-cph-receiver-0.7.1.vsix` (or the newer package you built).
 4. Reload VS Code after installation.
 
 You can also install it from a terminal:
 
 ```powershell
-code --install-extension .\vscode-extension\leetcode-cph-receiver-0.7.0.vsix
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.7.1.vsix
 ```
 
 To build the VSIX from source, run:
