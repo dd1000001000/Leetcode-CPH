@@ -42,6 +42,9 @@ const problemLocks = new Map();
 const solutionRecordCache = new Map();
 const activeCaptureJobs = new Set();
 const supersededCaptureJobs = new Set();
+const activeProblemAiOperations = new Map();
+const cancelledProblemAiFolders = new Map();
+let nextProblemAiOperationId = 1;
 const PROBLEM_STATE_DIRECTORY = '.leetcode_cph';
 // Per-problem reference counts prevent overlapping callers from clearing each
 // other's busy state. A regenerate request can be queued behind a mutation,
@@ -222,7 +225,10 @@ function supersedeOlderCaptureJobs(problemFolder, currentRevision) {
   const prefix = `${pathKey(problemFolder)}\0`;
   const currentKey = captureJobKey(problemFolder, currentRevision);
   for (const key of activeCaptureJobs) {
-    if (key.startsWith(prefix) && key !== currentKey) supersededCaptureJobs.add(key);
+    if (!key.startsWith(prefix) || key === currentKey) continue;
+    supersededCaptureJobs.add(key);
+    const operation = findCaptureAiOperation(key);
+    if (operation) cancelProblemAiOperation(operation, '该 AI 任务已被更新的浏览器抓取替代。');
   }
 }
 
@@ -234,6 +240,173 @@ function endTestcaseAiJob(identityKey) {
   const remaining = (activeTestcaseAiJobs.get(identityKey) || 0) - 1;
   if (remaining > 0) activeTestcaseAiJobs.set(identityKey, remaining);
   else activeTestcaseAiJobs.delete(identityKey);
+}
+
+function aiOperationCancelledError(message = 'AI 处理期间题目相关文件被删除，本次任务已取消。') {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  error.code = 'LEETCODE_CPH_AI_CANCELLED';
+  return error;
+}
+
+function aiInputInvalidatedError(message = 'AI 处理期间题目文件发生变化，本次结果已丢弃。') {
+  const error = new Error(message);
+  error.code = 'LEETCODE_CPH_AI_INPUT_INVALIDATED';
+  return error;
+}
+
+function isAiOperationInvalidated(error) {
+  return error?.code === 'LEETCODE_CPH_AI_CANCELLED'
+    || error?.code === 'LEETCODE_CPH_AI_INPUT_INVALIDATED'
+    || error?.name === 'AbortError';
+}
+
+function createAiCancellationController() {
+  const listeners = new Set();
+  const signal = {
+    aborted: false,
+    reason: undefined,
+    addEventListener(type, listener) {
+      if (type !== 'abort' || typeof listener !== 'function') return;
+      listeners.add(listener);
+      if (signal.aborted) listener.call(signal, { type: 'abort', target: signal });
+    },
+    removeEventListener(type, listener) {
+      if (type === 'abort') listeners.delete(listener);
+    }
+  };
+  return {
+    signal,
+    abort(reason) {
+      if (signal.aborted) return;
+      signal.aborted = true;
+      signal.reason = reason || aiOperationCancelledError();
+      for (const listener of [...listeners]) {
+        try { listener.call(signal, { type: 'abort', target: signal }); } catch (_) { /* Cancellation must continue. */ }
+      }
+      listeners.clear();
+    }
+  };
+}
+
+function problemAiOperationSet(folderKey, create = false) {
+  let operations = activeProblemAiOperations.get(folderKey);
+  if (!operations && create) {
+    operations = new Set();
+    activeProblemAiOperations.set(folderKey, operations);
+  }
+  return operations;
+}
+
+function registerProblemAiOperation(problemFolder, {
+  kind,
+  captureRevision = '',
+  solutionPath = ''
+} = {}) {
+  const folder = path.resolve(problemFolder);
+  const folderKey = pathKey(folder);
+  const controller = createAiCancellationController();
+  let resolveCancellation;
+  const cancellation = new Promise((resolve) => { resolveCancellation = resolve; });
+  const resolvedSolution = solutionPath ? path.resolve(solutionPath) : '';
+  const operation = {
+    id: nextProblemAiOperationId++,
+    kind: kind === 'capture' ? 'capture' : 'scaffold',
+    folder,
+    folderKey,
+    captureRevision: String(captureRevision || ''),
+    jobKey: kind === 'capture' ? captureJobKey(folder, captureRevision) : '',
+    solutionPath: resolvedSolution,
+    mainPath: resolvedSolution
+      ? path.join(path.dirname(resolvedSolution), `main${path.extname(resolvedSolution)}`)
+      : '',
+    controller,
+    signal: controller.signal,
+    cancellation,
+    resolveCancellation,
+    cancelled: false,
+    cancelledError: null,
+    deletedPaths: [],
+    busyReleased: false,
+    finished: false
+  };
+  problemAiOperationSet(folderKey, true).add(operation);
+  cancelledProblemAiFolders.delete(folderKey);
+  if (operation.kind === 'capture') activeCaptureJobs.add(operation.jobKey);
+  else beginTestcaseAiJob(folderKey);
+  return operation;
+}
+
+function bindProblemAiOperation(operation, context) {
+  if (!operation || !context) return operation;
+  operation.folder = path.resolve(context.folder || operation.folder);
+  operation.folderKey = pathKey(operation.folder);
+  operation.captureRevision = String(context.metadata?.captureRevision || operation.captureRevision || '');
+  operation.solutionPath = path.resolve(context.solutionPath || operation.solutionPath);
+  operation.mainPath = scaffoldFilePath(context);
+  return operation;
+}
+
+function releaseProblemAiOperationBusy(operation) {
+  if (!operation || operation.busyReleased) return;
+  operation.busyReleased = true;
+  if (operation.kind === 'capture') activeCaptureJobs.delete(operation.jobKey);
+  else endTestcaseAiJob(operation.folderKey);
+}
+
+function finishProblemAiOperation(operation) {
+  if (!operation || operation.finished) return;
+  operation.finished = true;
+  releaseProblemAiOperationBusy(operation);
+  const operations = problemAiOperationSet(operation.folderKey);
+  operations?.delete(operation);
+  if (operations && !operations.size) activeProblemAiOperations.delete(operation.folderKey);
+  if (operation.kind === 'capture') supersededCaptureJobs.delete(operation.jobKey);
+}
+
+function cancelProblemAiOperation(operation, message, deletedPaths = []) {
+  if (!operation || operation.cancelled || operation.finished) return false;
+  const error = aiOperationCancelledError(message);
+  operation.cancelled = true;
+  operation.cancelledError = error;
+  operation.deletedPaths = deletedPaths.map((filePath) => path.resolve(filePath));
+  if (operation.kind === 'capture') supersededCaptureJobs.add(operation.jobKey);
+  releaseProblemAiOperationBusy(operation);
+  cancelledProblemAiFolders.set(operation.folderKey, { operationId: operation.id, message: error.message });
+  operation.controller.abort(error);
+  operation.resolveCancellation(error);
+  return true;
+}
+
+function throwIfProblemAiOperationCancelled(operation) {
+  if (operation?.cancelled || operation?.signal?.aborted) {
+    throw operation.cancelledError || operation.signal?.reason || aiOperationCancelledError();
+  }
+}
+
+async function awaitProblemAiOperation(operation, providerPromise) {
+  if (!operation) return providerPromise;
+  throwIfProblemAiOperationCancelled(operation);
+  const outcome = await Promise.race([
+    Promise.resolve(providerPromise).then(
+      (value) => ({ type: 'value', value }),
+      (error) => ({ type: 'error', error })
+    ),
+    operation.cancellation.then((error) => ({ type: 'cancelled', error }))
+  ]);
+  if (outcome.type === 'cancelled') throw outcome.error;
+  if (outcome.type === 'error') throw outcome.error;
+  throwIfProblemAiOperationCancelled(operation);
+  return outcome.value;
+}
+
+function findCaptureAiOperation(jobKey) {
+  for (const operations of activeProblemAiOperations.values()) {
+    for (const operation of operations) {
+      if (operation.kind === 'capture' && operation.jobKey === jobKey) return operation;
+    }
+  }
+  return null;
 }
 
 function reservedSolutionFileName(filePath) {
@@ -566,7 +739,8 @@ async function loadSanitizedTestCaseState(problemFolder) {
   return { ...state, testCases };
 }
 
-async function extractCapturedTestCases(payload) {
+async function extractCapturedTestCases(payload, operation) {
+  throwIfProblemAiOperationCancelled(operation);
   const ai = await configuredAiState();
   if (!ai.configured) {
     return {
@@ -578,11 +752,12 @@ async function extractCapturedTestCases(payload) {
     };
   }
   try {
-    const extracted = await aiTestcaseService.extractTestCases({
+    const extracted = await awaitProblemAiOperation(operation, aiTestcaseService.extractTestCases({
       metadata: payload,
       provider: ai.provider,
-      model: ai.model
-    });
+      model: ai.model,
+      ...(operation?.signal ? { signal: operation.signal } : {})
+    }));
     return {
       status: extracted.testCases.length ? 'extracted' : 'empty',
       testCases: extracted.testCases,
@@ -593,6 +768,7 @@ async function extractCapturedTestCases(payload) {
         : 'AI 未在题面中找到明确的输入/输出示例。'
     };
   } catch (error) {
+    if (isAiOperationInvalidated(error) || operation?.cancelled) throw error;
     // Saving a problem must not fail merely because the optional remote AI
     // request is unavailable. A fresh capture remains empty (rather than
     // falling back to the old brittle DOM parser). A browser capture starts
@@ -803,7 +979,12 @@ async function saveCapture(payload) {
     // Older provider requests may still be in flight, but they must no longer
     // keep controls disabled or publish results when they eventually return.
     supersedeOlderCaptureJobs(folder, captureRevision);
-    if (ai.configured) activeCaptureJobs.add(captureJobKey(folder, captureRevision));
+    cancelledProblemAiFolders.delete(pathKey(folder));
+    const aiOperation = ai.configured
+      ? registerProblemAiOperation(folder, {
+          kind: 'capture', captureRevision, solutionPath: solution
+        })
+      : null;
     const overwrittenRecordBackup = replacesRegisteredProblem ? backupFolder : '';
     const overwrittenSolutionBackup = replacesRegisteredProblem && backupFolder
       ? path.join(backupFolder, path.basename(previousRegisteredSolution || solution))
@@ -812,7 +993,7 @@ async function saveCapture(payload) {
       folder: path.relative(root, base), file: path.relative(root, solution),
       solution, problemFolder: folder, solutionCreated, solutionBackup,
       overwrittenRecordBackup, overwrittenSolutionBackup,
-      scaffoldStale, extraction, aiPending: ai.configured, captureRevision
+      scaffoldStale, extraction, aiPending: ai.configured, captureRevision, aiOperation
     };
   });
   outputChannel?.appendLine(`Saved browser snapshot ${payload.title} → ${saved.solution}`);
@@ -833,11 +1014,27 @@ async function processCapturedAi(payload, saved) {
   const folder = saved.problemFolder;
   if (!folder) throw new Error('后台 AI 处理缺少 .leetcode_cph 题目记录位置。');
   const jobKey = captureJobKey(folder, saved.captureRevision);
+  const operation = saved.aiOperation || findCaptureAiOperation(jobKey);
   try {
-    const extraction = await extractCapturedTestCases(payload);
+    throwIfProblemAiOperationCancelled(operation);
+    const initialSnapshot = await snapshotAiProblemInputs({
+      folder,
+      solutionPath: saved.solution,
+      captureRevision: saved.captureRevision
+    });
+    const extraction = await extractCapturedTestCases(payload, operation);
+    throwIfProblemAiOperationCancelled(operation);
     if (supersededCaptureJobs.has(jobKey)) return { extraction, superseded: true };
     return await withProblemLock(folder, async () => {
-    await assertSafeProblemStateFolder(folder);
+    throwIfProblemAiOperationCancelled(operation);
+    const verifyInputsBeforeCommit = async () => {
+      throwIfProblemAiOperationCancelled(operation);
+      if (supersededCaptureJobs.has(jobKey)) {
+        throw aiInputInvalidatedError('AI 处理期间该抓取任务已被更新或移动，中止写入。');
+      }
+      await assertAiProblemInputsUnchanged(initialSnapshot);
+    };
+    await assertAiProblemInputsUnchanged(initialSnapshot);
     const metadataPath = path.join(folder, 'metadata.json');
     let currentMetadata;
     try {
@@ -894,13 +1091,21 @@ async function processCapturedAi(payload, saved) {
       const { testcaseScaffoldError, ...withoutError } = nextMetadata;
       nextMetadata = withoutError;
     }
-    await Promise.all([
-      saveTestCases(folder, testCases, {
-        excludedAiIds: previousState.excludedAiIds,
-        excludedLeetCodeIds: previousState.excludedLeetCodeIds
-      }),
-      writeTextAtomically(metadataPath, JSON.stringify(nextMetadata, null, 2))
-    ]);
+    throwIfProblemAiOperationCancelled(operation);
+    await verifyInputsBeforeCommit();
+    await saveTestCases(folder, testCases, {
+      excludedAiIds: previousState.excludedAiIds,
+      excludedLeetCodeIds: previousState.excludedLeetCodeIds,
+      createDirectory: false,
+      beforeCommit: verifyInputsBeforeCommit
+    });
+    throwIfProblemAiOperationCancelled(operation);
+    if (!await assertSafeProblemStateFolder(folder)) {
+      throw aiInputInvalidatedError('AI 处理期间 .leetcode_cph 已被删除，本次结果不会继续写入。');
+    }
+    await writeTextAtomically(metadataPath, JSON.stringify(nextMetadata, null, 2), {
+      beforeCommit: verifyInputsBeforeCommit
+    });
 
     let scaffoldGenerated = false;
     let scaffoldError = '';
@@ -921,10 +1126,11 @@ async function processCapturedAi(payload, saved) {
           language: currentMetadata.language || payload.language,
           testCases
         };
-        await generateTestScaffold(generationContext, testCases, { type: 'initialize' });
+        await generateTestScaffold(generationContext, testCases, { type: 'initialize' }, operation);
         scaffoldGenerated = true;
         scaffoldStale = false;
       } catch (error) {
+        if (isAiOperationInvalidated(error) || operation?.cancelled) throw error;
         scaffoldError = String(error?.message || 'AI 生成测试脚手架失败。').slice(0, 800);
         outputChannel?.appendLine(`Background testcase scaffold generation failed: ${scaffoldError}`);
         scaffoldStale = true;
@@ -943,9 +1149,17 @@ async function processCapturedAi(payload, saved) {
       }
       return { extraction: persistedExtraction, testCases, scaffoldGenerated, scaffoldStale, scaffoldError };
     });
+  } catch (error) {
+    if (operation?.cancelled || supersededCaptureJobs.has(jobKey)) {
+      return { superseded: true, cancelled: true };
+    }
+    throw error;
   } finally {
-    activeCaptureJobs.delete(jobKey);
-    supersededCaptureJobs.delete(jobKey);
+    if (operation) finishProblemAiOperation(operation);
+    else {
+      activeCaptureJobs.delete(jobKey);
+      supersededCaptureJobs.delete(jobKey);
+    }
   }
 }
 
@@ -974,6 +1188,123 @@ async function markCaptureProcessingFailed(saved, error) {
     };
     await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2));
   });
+}
+
+function deletedPathCovers(deletedPath, targetPath) {
+  const deleted = path.resolve(deletedPath);
+  const target = path.resolve(targetPath);
+  return pathKey(deleted) === pathKey(target) || isPathInside(deleted, target);
+}
+
+function problemAiOperationDeletedPaths(operation, deletedPaths) {
+  const problemDirectory = path.dirname(operation.folder);
+  const trackedPaths = [
+    problemDirectory,
+    operation.folder,
+    path.join(operation.folder, 'metadata.json'),
+    path.join(operation.folder, TEST_CASES_FILE),
+    operation.solutionPath,
+    operation.mainPath
+  ].filter(Boolean);
+  return deletedPaths.filter((deletedPath) => trackedPaths.some((targetPath) => deletedPathCovers(deletedPath, targetPath)));
+}
+
+function invalidateAiJobsForDeletedPaths(values) {
+  const deletedPaths = (Array.isArray(values) ? values : [])
+    .filter((value) => typeof value === 'string' && value)
+    .map((value) => path.resolve(value));
+  if (!deletedPaths.length) return [];
+  const cancelled = [];
+  for (const operations of [...activeProblemAiOperations.values()]) {
+    for (const operation of [...operations]) {
+      const matchedPaths = problemAiOperationDeletedPaths(operation, deletedPaths);
+      if (!matchedPaths.length) continue;
+      const deletedName = path.basename(matchedPaths[0]);
+      const message = `AI 处理期间 ${deletedName || '题目文件'} 被删除，本次任务已取消；模型返回后不会写入任何文件。`;
+      if (!cancelProblemAiOperation(operation, message, matchedPaths)) continue;
+      clearCachedProblemFolder(operation.folder);
+      clearRunResults(operation.folder);
+      cancelled.push(operation);
+    }
+  }
+  return cancelled;
+}
+
+function cancelledOperationMetadata(metadata, operation) {
+  const message = operation.cancelledError?.message || 'AI 处理期间题目文件被删除，本次任务已取消。';
+  const next = {
+    ...metadata,
+    testcaseScaffoldStale: true,
+    testcaseScaffoldError: message
+  };
+  if (operation.kind === 'capture' && metadata?.testcaseExtraction?.status === 'pending') {
+    next.testcaseExtraction = {
+      ...metadata.testcaseExtraction,
+      status: 'failed',
+      message,
+      at: new Date().toISOString()
+    };
+  }
+  return next;
+}
+
+async function persistCancelledProblemAiOperation(operation) {
+  const metadataPath = path.join(operation.folder, 'metadata.json');
+  if (operation.deletedPaths.some((deletedPath) => deletedPathCovers(deletedPath, metadataPath))) return;
+  await withProblemLock(operation.folder, async () => {
+    if (!await assertSafeProblemStateFolder(operation.folder)) return;
+    const metadataSnapshot = await snapshotFile(metadataPath);
+    if (!metadataSnapshot.exists) return;
+    let metadata;
+    try {
+      metadata = JSON.parse(metadataSnapshot.content.toString('utf8'));
+    } catch (_) {
+      return;
+    }
+    if (operation.captureRevision
+      && String(metadata?.captureRevision || '') !== String(operation.captureRevision)) return;
+    const next = cancelledOperationMetadata(metadata, operation);
+    await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2), {
+      beforeCommit: async () => {
+        if (!await assertSafeProblemStateFolder(operation.folder)) {
+          throw aiInputInvalidatedError('.leetcode_cph 已被删除，不会重新创建状态文件。');
+        }
+        const current = await snapshotFile(metadataPath);
+        if (!sameFileSnapshot(metadataSnapshot, current)) {
+          throw aiInputInvalidatedError('metadata.json 在取消任务后又发生变化，未覆盖较新的状态。');
+        }
+      }
+    });
+  });
+}
+
+async function handleProblemDeletes(event) {
+  const deletedPaths = (event?.files || [])
+    .filter((uri) => uri?.scheme === 'file' && typeof uri.fsPath === 'string')
+    .map((uri) => uri.fsPath);
+  const cancelled = invalidateAiJobsForDeletedPaths(deletedPaths);
+  if (!cancelled.length) return [];
+  const message = cancelled[0].cancelledError.message;
+  setSidebarRuntime({
+    busy: false,
+    testcaseMutationBusy: false,
+    runBusy: false,
+    runningCaseId: '',
+    notice: '',
+    error: message
+  });
+  void refreshSidebar();
+  await Promise.all(cancelled.map(async (operation) => {
+    try {
+      await persistCancelledProblemAiOperation(operation);
+    } catch (error) {
+      if (!isAiOperationInvalidated(error)) {
+        outputChannel?.appendLine(`Could not persist deleted-file AI cancellation: ${error.stack || error.message}`);
+      }
+    }
+  }));
+  void refreshSidebar();
+  return cancelled;
 }
 
 function interruptedCaptureMetadata(metadata, message = '上次 AI 处理因 VS Code 重载或题目目录移动而中断；请重新抓取题目后重试。') {
@@ -1236,6 +1567,99 @@ async function snapshotFile(filePath) {
   }
 }
 
+function sameFileSnapshot(left, right) {
+  return Boolean(left?.exists) === Boolean(right?.exists)
+    && (!left?.exists || Buffer.from(left.content).equals(Buffer.from(right.content)));
+}
+
+async function snapshotAiProblemInputs({ folder, solutionPath, captureRevision = '' }) {
+  let stateExists;
+  try {
+    stateExists = await assertSafeProblemStateFolder(folder);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw aiInputInvalidatedError('AI 处理期间题目目录已被删除，本次结果不会写入。');
+    }
+    throw error;
+  }
+  if (!stateExists) {
+    throw aiInputInvalidatedError('AI 处理期间 .leetcode_cph 已被删除，本次结果不会写入。');
+  }
+  const metadataPath = path.join(folder, 'metadata.json');
+  const testCasesPath = path.join(folder, TEST_CASES_FILE);
+  const mainPath = path.join(path.dirname(solutionPath), `main${path.extname(solutionPath)}`);
+  try {
+    await assertSafeProblemArtifact(folder, solutionPath, { allowMissing: false });
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw aiInputInvalidatedError('AI 处理期间 solution 文件已被删除，本次结果不会写入。');
+    }
+    throw error;
+  }
+  let safeMainExists;
+  try {
+    safeMainExists = await assertSafeProblemArtifact(folder, mainPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw aiInputInvalidatedError('AI 处理期间题目目录或 .leetcode_cph 已被删除，本次结果不会写入。');
+    }
+    throw error;
+  }
+  const [metadata, testCases, solution, main] = await Promise.all([
+    snapshotFile(metadataPath),
+    snapshotFile(testCasesPath),
+    snapshotFile(solutionPath),
+    snapshotFile(mainPath)
+  ]);
+  if (!metadata.exists) {
+    throw aiInputInvalidatedError('AI 处理期间 metadata.json 已被删除，本次结果不会写入。');
+  }
+  if (!testCases.exists) {
+    throw aiInputInvalidatedError('AI 处理期间 testcases.json 已被删除，本次结果不会写入。');
+  }
+  if (!solution.exists) {
+    throw aiInputInvalidatedError('AI 处理期间 solution 文件已被删除，本次结果不会写入。');
+  }
+  if (Boolean(main.exists) !== Boolean(safeMainExists)) {
+    throw aiInputInvalidatedError('AI 处理期间 main 被删除或修改，本次结果不会写入。');
+  }
+  let parsedMetadata;
+  try {
+    parsedMetadata = JSON.parse(metadata.content.toString('utf8'));
+  } catch (_) {
+    throw aiInputInvalidatedError('AI 处理期间 metadata.json 已损坏，本次结果不会写入。');
+  }
+  if (captureRevision && String(parsedMetadata?.captureRevision || '') !== String(captureRevision)) {
+    throw aiInputInvalidatedError('AI 处理期间题目记录已被其他抓取替换，本次结果不会写入。');
+  }
+  return {
+    folder: path.resolve(folder),
+    solutionPath: path.resolve(solutionPath),
+    captureRevision: String(captureRevision || parsedMetadata?.captureRevision || ''),
+    metadataPath,
+    testCasesPath,
+    mainPath,
+    metadata,
+    testCases,
+    solution,
+    main
+  };
+}
+
+async function assertAiProblemInputsUnchanged(expected, { ignoreMain = false } = {}) {
+  const current = await snapshotAiProblemInputs(expected);
+  const keys = ignoreMain ? ['metadata', 'testCases', 'solution'] : ['metadata', 'testCases', 'solution', 'main'];
+  for (const key of keys) {
+    if (!sameFileSnapshot(expected[key], current[key])) {
+      const label = key === 'testCases' ? TEST_CASES_FILE
+        : key === 'metadata' ? 'metadata.json'
+          : key === 'solution' ? path.basename(expected.solutionPath) : path.basename(expected.mainPath);
+      throw aiInputInvalidatedError(`AI 处理期间 ${label} 已发生变化（被删除或修改），本次结果不会写入。`);
+    }
+  }
+  return current;
+}
+
 async function restoreFileSnapshot(filePath, snapshot) {
   if (snapshot?.exists) {
     await writeFileAtomically(filePath, snapshot.content);
@@ -1246,7 +1670,39 @@ async function restoreFileSnapshot(filePath, snapshot) {
   }
 }
 
-async function writeFileAtomically(filePath, content) {
+function normalizedAtomicText(value) {
+  return `${String(value).replace(/\r?\n?$/, '')}\n`;
+}
+
+async function rollbackCancelledAiWrite(filePath, generatedText, previousSnapshot, operation) {
+  const current = await snapshotFile(filePath);
+  const generated = Buffer.from(normalizedAtomicText(generatedText), 'utf8');
+  if (!current.exists || !Buffer.from(current.content).equals(generated)) return;
+  const deletedByUser = operation?.deletedPaths?.some((deletedPath) => deletedPathCovers(deletedPath, filePath));
+  if (deletedByUser || !previousSnapshot?.exists) {
+    await fs.unlink(filePath).catch((error) => { if (error?.code !== 'ENOENT') throw error; });
+    return;
+  }
+  await writeFileAtomically(filePath, previousSnapshot.content);
+}
+
+async function removeCancelledAiBackup(backupFile, stateFolder) {
+  if (!backupFile) return;
+  const backupFolder = path.dirname(path.resolve(backupFile));
+  const backupsRoot = path.join(path.resolve(stateFolder), 'backups');
+  if (pathKey(path.dirname(backupFolder)) !== pathKey(backupsRoot)) return;
+  let stat;
+  try { stat = await fs.lstat(backupFolder); } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) return;
+  const [stateReal, backupReal] = await Promise.all([fs.realpath(stateFolder), fs.realpath(backupFolder)]);
+  if (!isPathInside(stateReal, backupReal)) return;
+  await fs.rm(backupFolder, { recursive: true, force: true });
+}
+
+async function writeFileAtomically(filePath, content, { beforeCommit } = {}) {
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
     await fs.writeFile(temporary, content, 'utf8');
@@ -1254,6 +1710,7 @@ async function writeFileAtomically(filePath, content) {
     const delays = [10, 25, 50, 100];
     for (let attempt = 0; attempt <= delays.length; attempt += 1) {
       try {
+        if (typeof beforeCommit === 'function') await beforeCommit();
         await fs.rename(temporary, filePath);
         lastError = undefined;
         break;
@@ -1272,8 +1729,8 @@ async function writeFileAtomically(filePath, content) {
   }
 }
 
-async function writeTextAtomically(filePath, content) {
-  return writeFileAtomically(filePath, `${String(content).replace(/\r?\n?$/, '')}\n`);
+async function writeTextAtomically(filePath, content, options) {
+  return writeFileAtomically(filePath, normalizedAtomicText(content), options);
 }
 
 async function loadOrMigrateTestCases(problemFolder, metadata) {
@@ -1546,12 +2003,19 @@ async function ensurePersistedTestCases(context) {
   return { ...context, testCases };
 }
 
-async function markScaffoldFresh(context) {
+async function markScaffoldFresh(context, { operation, inputSnapshot } = {}) {
   if (!context.metadata?.testcaseScaffoldStale) return;
+  throwIfProblemAiOperationCancelled(operation);
+  if (inputSnapshot) await assertAiProblemInputsUnchanged(inputSnapshot, { ignoreMain: true });
   const metadataPath = path.join(context.folder, 'metadata.json');
   const { testcaseScaffoldError, ...metadataWithoutError } = context.metadata;
   const nextMetadata = { ...metadataWithoutError, testcaseScaffoldStale: false };
-  await writeTextAtomically(metadataPath, JSON.stringify(nextMetadata, null, 2));
+  await writeTextAtomically(metadataPath, JSON.stringify(nextMetadata, null, 2), {
+    beforeCommit: async () => {
+      throwIfProblemAiOperationCancelled(operation);
+      if (inputSnapshot) await assertAiProblemInputsUnchanged(inputSnapshot, { ignoreMain: true });
+    }
+  });
   context.metadata = nextMetadata;
 }
 
@@ -1604,7 +2068,8 @@ async function extractTestCasesForContext(context) {
   return { ...context, metadata: nextMetadata, testCases, extraction: extracted, testCasesChanged: changed };
 }
 
-async function generateTestScaffold(context, testCases, operation) {
+async function generateTestScaffold(context, testCases, operation, aiOperation) {
+  throwIfProblemAiOperationCancelled(aiOperation);
   if (context?.localOnly) throw new Error('该 solution 没有有效的 .leetcode_cph 题目记录，不能生成 main 测试代码。');
   if (reservedSolutionFileName(context?.solutionPath)) {
     throw new Error('题目解答不能命名为 main.<语言> 或 testcase.<语言>，已拒绝覆盖。请将文件改回 solution.<语言>。');
@@ -1617,8 +2082,11 @@ async function generateTestScaffold(context, testCases, operation) {
     throw new Error('当前没有测试用例，无法生成测试脚手架。');
   }
   requireTrustedWorkspace('生成');
-  await assertSafeProblemStateFolder(context.folder);
-  await assertSafeProblemArtifact(context.folder, context.solutionPath, { allowMissing: false });
+  const inputSnapshot = await snapshotAiProblemInputs({
+    folder: context.folder,
+    solutionPath: context.solutionPath,
+    captureRevision: context.metadata?.captureRevision
+  });
   const ai = await configuredAiState();
   if (!ai.configured) {
     const label = providerInfo(ai.provider).label;
@@ -1650,18 +2118,20 @@ async function generateTestScaffold(context, testCases, operation) {
     runtimeSolutionFileName: path.basename(runtimeSolutionFilePath(context)),
     mainFileName: path.basename(destination)
   };
-  const generated = await aiTestcaseService.generateScaffold({
+  const generated = await awaitProblemAiOperation(aiOperation, aiTestcaseService.generateScaffold({
     metadata: scaffoldMetadata,
     solutionCode: context.code,
     testCases,
     operation,
     existingScaffold,
     provider: ai.provider,
-    model: ai.model
-  });
+    model: ai.model,
+    ...(aiOperation?.signal ? { signal: aiOperation.signal } : {})
+  }));
+  throwIfProblemAiOperationCancelled(aiOperation);
   // The provider call may take long enough for workspace paths to change.
   // Revalidate every filesystem boundary before writing its result.
-  await assertSafeProblemStateFolder(context.folder);
+  await assertAiProblemInputsUnchanged(inputSnapshot);
   await assertSafeProblemArtifact(context.folder, context.solutionPath, { allowMissing: false });
   const currentSolutionCode = await readOpenDocumentOrFile(context.solutionPath);
   if (currentSolutionCode !== context.code) {
@@ -1684,18 +2154,49 @@ async function generateTestScaffold(context, testCases, operation) {
   // user has adjusted manually.  Keep one immediately-restorable copy before
   // the atomic replacement; if this write fails, leave the live scaffold
   // untouched instead of risking the user's local framework.
-  const backup = destinationExists
-    ? path.join(await createProblemBackupFolder(context.folder), path.basename(destination))
-    : '';
-  if (backup) await writeTextAtomically(backup, existingScaffold);
-  await writeTextAtomically(destination, generated.content);
+  let backup = '';
+  let destinationWritten = false;
   try {
-    await markScaffoldFresh(context);
+    throwIfProblemAiOperationCancelled(aiOperation);
+    await assertAiProblemInputsUnchanged(inputSnapshot);
+    if (destinationExists) {
+      backup = path.join(await createProblemBackupFolder(context.folder), path.basename(destination));
+      throwIfProblemAiOperationCancelled(aiOperation);
+      await assertAiProblemInputsUnchanged(inputSnapshot);
+      await writeTextAtomically(backup, existingScaffold, {
+        beforeCommit: async () => {
+          throwIfProblemAiOperationCancelled(aiOperation);
+          await assertAiProblemInputsUnchanged(inputSnapshot);
+        }
+      });
+    }
+    await writeTextAtomically(destination, generated.content, {
+      beforeCommit: async () => {
+        throwIfProblemAiOperationCancelled(aiOperation);
+        await assertAiProblemInputsUnchanged(inputSnapshot);
+      }
+    });
+    destinationWritten = true;
+    throwIfProblemAiOperationCancelled(aiOperation);
+    try {
+      await markScaffoldFresh(context, { operation: aiOperation, inputSnapshot });
+    } catch (error) {
+      if (isAiOperationInvalidated(error) || aiOperation?.cancelled) throw error;
+      // The scaffold itself was written successfully.  Leaving the stale badge
+      // visible is safer than reporting the entire mutation as failed and
+      // rolling back its testcase JSON after the source file changed.
+      outputChannel?.appendLine(`Could not clear testcase scaffold stale marker: ${error.message}`);
+    }
   } catch (error) {
-    // The scaffold itself was written successfully.  Leaving the stale badge
-    // visible is safer than reporting the entire mutation as failed and
-    // rolling back its testcase JSON after the source file changed.
-    outputChannel?.appendLine(`Could not clear testcase scaffold stale marker: ${error.message}`);
+    if (isAiOperationInvalidated(error) || aiOperation?.cancelled) {
+      if (destinationWritten) {
+        await rollbackCancelledAiWrite(destination, generated.content, inputSnapshot.main, aiOperation)
+          .catch((rollbackError) => outputChannel?.appendLine(`Could not roll back cancelled AI scaffold: ${rollbackError.stack || rollbackError.message}`));
+      }
+      await removeCancelledAiBackup(backup, context.folder)
+        .catch((cleanupError) => outputChannel?.appendLine(`Could not remove cancelled AI backup: ${cleanupError.stack || cleanupError.message}`));
+    }
+    throw error;
   }
   return { ...generated, destination, backup };
 }
@@ -1828,7 +2329,8 @@ function assertSidebarProblem(context, expectedProblemKey) {
 
 function assertProblemAiIdle(context) {
   if (context?.localOnly) return;
-  const pendingExtraction = context?.metadata?.testcaseExtraction?.status === 'pending';
+  const pendingExtraction = context?.metadata?.testcaseExtraction?.status === 'pending'
+    && !cancelledProblemAiFolders.has(pathKey(context.folder));
   if (pendingExtraction || captureJobActiveForFolder(context.folder)
     || activeTestcaseAiJobs.has(pathKey(context.folder))) {
     throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后重试。');
@@ -1882,7 +2384,9 @@ async function sidebarState(extra = {}) {
   }
   const hasScaffold = await fileExists(scaffoldFilePath(context));
   const runnerSupported = !context.localOnly && supportsLanguage(scaffoldFilePath(context));
-  const persistedExtractionPending = !context.localOnly && context.metadata?.testcaseExtraction?.status === 'pending';
+  const cancelledByDeletion = !context.localOnly && cancelledProblemAiFolders.has(pathKey(context.folder));
+  const rawExtractionPending = !context.localOnly && context.metadata?.testcaseExtraction?.status === 'pending';
+  const persistedExtractionPending = rawExtractionPending && !cancelledByDeletion;
   const extractionPending = persistedExtractionPending && activeCaptureJobs.has(
     captureJobKey(context.folder, context.metadata?.captureRevision)
   );
@@ -1894,16 +2398,17 @@ async function sidebarState(extra = {}) {
   // Background HTTP work cannot survive an extension-host reload. Do not
   // leave the sidebar permanently disabled by a durable "pending" marker
   // when no task for that exact capture revision exists in this process.
-  const extractionInterrupted = persistedExtractionPending && !extractionPending;
+  const extractionInterrupted = rawExtractionPending && !extractionPending;
   const scaffoldStatus = scaffoldStatusPresentation({
     hasScaffold,
     generationActive,
-    stale: Boolean(context.metadata?.testcaseScaffoldStale) || extractionInterrupted
+    stale: Boolean(context.metadata?.testcaseScaffoldStale) || extractionInterrupted || cancelledByDeletion
   });
   const hasRunnableTestCases = context.testCases.some(testcaseHasRunnableData);
   const scaffoldReady = !context.localOnly && hasScaffold
     && !context.metadata?.testcaseScaffoldStale
     && !persistedExtractionPending
+    && !cancelledByDeletion
     && !aiBusy;
   return {
     ...empty,
@@ -1994,13 +2499,18 @@ async function configureAi() {
   return { provider: provider.id, model: model.trim() || PROVIDERS[provider.id].defaultModel };
 }
 
-async function markScaffoldStale(context, errorMessage = '') {
+async function markScaffoldStale(context, errorMessage = '', operation) {
+  throwIfProblemAiOperationCancelled(operation);
+  if (!await assertSafeProblemStateFolder(context.folder)) {
+    throw aiInputInvalidatedError('AI 处理期间 .leetcode_cph 已被删除，未更新脚手架状态。');
+  }
   const { testcaseScaffoldError, ...metadataWithoutError } = context.metadata || {};
   const nextMetadata = { ...metadataWithoutError, testcaseScaffoldStale: true };
   if (errorMessage) nextMetadata.testcaseScaffoldError = errorMessage;
   await writeTextAtomically(
     path.join(context.folder, 'metadata.json'),
-    JSON.stringify(nextMetadata, null, 2)
+    JSON.stringify(nextMetadata, null, 2),
+    { beforeCommit: () => throwIfProblemAiOperationCancelled(operation) }
   );
   context.metadata = nextMetadata;
   return nextMetadata;
@@ -2041,7 +2551,7 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
   if (!identity.localOnly && (captureJobActiveForFolder(identity.folder) || activeTestcaseAiJobs.has(identityKey))) {
     throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后再修改测试用例。');
   }
-  let aiJobStarted = false;
+  let aiOperation = null;
   try {
     return await withProblemLock(identity.folder, async () => {
       let context = await problemContextFromIdentity(identity, { lockHeld: true });
@@ -2066,28 +2576,39 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
       const previousMetadata = context.metadata;
       let metadataMarkedStale = false;
       if (plannedGeneration) {
+        aiOperation = registerProblemAiOperation(context.folder, {
+          kind: 'scaffold',
+          captureRevision: context.metadata?.captureRevision,
+          solutionPath: context.solutionPath
+        });
         // Invalidate main before committing testcases.json. If the extension
         // host stops between the two writes, the old scaffold remains safely
         // non-runnable instead of being paired with a newer testcase set.
-        await markScaffoldStale(context);
+        await markScaffoldStale(context, '', aiOperation);
         metadataMarkedStale = true;
       }
 
       let changed;
       try {
+        const mutationOptions = aiOperation
+          ? {
+              createDirectory: false,
+              beforeCommit: () => throwIfProblemAiOperationCancelled(aiOperation)
+            }
+          : {};
         if (type === 'add') {
           // The green add button always creates an empty draft. Test data can
           // only enter the store through the card's explicit Save action.
-          changed = await createTestCase(context.folder, {});
+          changed = await createTestCase(context.folder, {}, mutationOptions);
         } else if (type === 'update') {
-          changed = await updateTestCase(context.folder, payload?.id, payload);
+          changed = await updateTestCase(context.folder, payload?.id, payload, mutationOptions);
         } else if (type === 'delete') {
-          changed = await deleteTestCase(context.folder, payload?.id);
+          changed = await deleteTestCase(context.folder, payload?.id, mutationOptions);
         } else {
           throw new Error('未知的测试用例操作。');
         }
       } catch (error) {
-        if (metadataMarkedStale) {
+        if (metadataMarkedStale && !aiOperation?.cancelled && !isAiOperationInvalidated(error)) {
           // No testcase change was committed. Restore the prior state when
           // possible; if restoration itself fails, leaving stale=true is the
           // conservative and safe outcome.
@@ -2128,9 +2649,7 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
       // A newly completed case or a deleted scaffolded case changes the
       // runner contract. Mark the old main stale before making the provider
       // request so it cannot be run after a crash or failed generation.
-      if (!metadataMarkedStale) await markScaffoldStale(context);
-      beginTestcaseAiJob(identityKey);
-      aiJobStarted = true;
+      if (!metadataMarkedStale) await markScaffoldStale(context, '', aiOperation);
       if (typeof onPersisted === 'function') await onPersisted({ ...changed, context });
 
       try {
@@ -2143,10 +2662,14 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
         const generated = await generateTestScaffold(
           context,
           changed.testCases,
-          { type: operationType, testCase: affected }
+          { type: operationType, testCase: affected },
+          aiOperation
         );
         return { ...changed, generated, completedNewCase };
       } catch (error) {
+        if (isAiOperationInvalidated(error) || aiOperation?.cancelled) {
+          throw aiOperation?.cancelledError || error;
+        }
         const detail = error?.message || '未知错误。';
         outputChannel?.appendLine(`Testcase scaffold update failed after saving testcase data: ${detail}`);
         await markScaffoldStale(context, detail).catch((writeError) => {
@@ -2156,7 +2679,7 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
       }
     });
   } finally {
-    if (aiJobStarted) endTestcaseAiJob(identityKey);
+    if (aiOperation) finishProblemAiOperation(aiOperation);
   }
 }
 
@@ -2169,11 +2692,16 @@ async function regenerateTestScaffold(payload = {}) {
   if (captureJobActiveForFolder(identity.folder) || activeTestcaseAiJobs.has(identityKey)) {
     throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后重试。');
   }
-  beginTestcaseAiJob(identityKey);
+  const aiOperation = registerProblemAiOperation(identity.folder, {
+    kind: 'scaffold',
+    solutionPath: identity.solutionPath
+  });
   void refreshSidebar();
   try {
     return await withProblemLock(identity.folder, async () => {
       let context = await problemContextFromIdentity(identity, { lockHeld: true });
+      bindProblemAiOperation(aiOperation, context);
+      throwIfProblemAiOperationCancelled(aiOperation);
       assertSidebarProblem(context, payload?.problemKey);
       if (context.metadata?.testcaseExtraction?.status === 'pending') {
         throw new Error('AI 测试用例提取尚未完成，请等待后重试。');
@@ -2182,12 +2710,12 @@ async function regenerateTestScaffold(payload = {}) {
       if (!context.testCases.some(testcaseHasRunnableData)) {
         throw new Error('请先至少填写并保存一个测试用例。');
       }
-      const generated = await generateTestScaffold(context, context.testCases, { type: 'regenerate' });
+      const generated = await generateTestScaffold(context, context.testCases, { type: 'regenerate' }, aiOperation);
       clearRunResults(context.folder);
       return { generated, context };
     });
   } finally {
-    endTestcaseAiJob(identityKey);
+    finishProblemAiOperation(aiOperation);
     void refreshSidebar();
   }
 }
@@ -2536,9 +3064,11 @@ function startServer() {
           }).catch(async (error) => {
             const message = error?.message || 'AI 后台处理失败。';
             outputChannel?.appendLine(`Background capture processing failed: ${error?.stack || message}`);
-            await markCaptureProcessingFailed(saved, error).catch((writeError) => {
-              outputChannel?.appendLine(`Could not persist background capture failure: ${writeError.message}`);
-            });
+            if (!isAiOperationInvalidated(error)) {
+              await markCaptureProcessingFailed(saved, error).catch((writeError) => {
+                outputChannel?.appendLine(`Could not persist background capture failure: ${writeError.message}`);
+              });
+            }
             setSidebarRuntime({ notice: '', error: `题面和网页代码已保存，但 ${message}` });
             void refreshSidebar();
           }).finally(() => { void refreshSidebar(); });
@@ -2587,15 +3117,22 @@ async function handleSolutionRenames(event) {
         }
         const destinationJobKey = captureJobKey(movedDirectoryState, metadata.captureRevision);
         const oldJobKey = captureJobKey(problemStateFolder(oldPath), metadata.captureRevision);
-        const destinationJobActive = activeCaptureJobs.has(destinationJobKey);
-        const oldJobActive = activeCaptureJobs.has(oldJobKey);
+        const destinationOperations = problemAiOperationSet(pathKey(movedDirectoryState));
+        const oldOperations = [...(problemAiOperationSet(pathKey(problemStateFolder(oldPath))) || [])]
+          .filter((operation) => !operation.cancelled && !operation.finished);
+        const destinationJobActive = activeCaptureJobs.has(destinationJobKey)
+          || [...(destinationOperations || [])].some((operation) => !operation.cancelled && !operation.finished);
+        const oldJobActive = activeCaptureJobs.has(oldJobKey) || oldOperations.length > 0;
         // A delayed rename event must never fail a newer capture that already
         // owns the destination record and is actively processing it. Otherwise
         // moving at any phase of the old job (extraction or scaffold generation)
         // interrupts that job and unlocks the moved record.
         if (!destinationJobActive
           && (oldJobActive || metadata?.testcaseExtraction?.status === 'pending')) {
-          if (oldJobActive) supersededCaptureJobs.add(oldJobKey);
+          for (const operation of oldOperations) {
+            cancelProblemAiOperation(operation, 'AI 处理期间题目目录被移动，本次任务已取消。');
+          }
+          if (activeCaptureJobs.has(oldJobKey)) supersededCaptureJobs.add(oldJobKey);
           metadata = interruptedCaptureMetadata(metadata);
           await writeTextAtomically(metadataPath, JSON.stringify(metadata, null, 2));
         }
@@ -2666,6 +3203,13 @@ function activate(context) {
       });
     }));
   }
+  if (typeof vscode.workspace.onDidDeleteFiles === 'function') {
+    context.subscriptions.push(vscode.workspace.onDidDeleteFiles((event) => {
+      void handleProblemDeletes(event).catch((error) => {
+        outputChannel?.appendLine(`Could not handle deleted problem files: ${error.stack || error.message}`);
+      });
+    }));
+  }
   if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('leetcodeCph.ai') || event.affectsConfiguration('leetcodeCph.outputDirectory')) {
@@ -2701,6 +3245,13 @@ function deactivate() {
   sidebarProvider = undefined;
   aiTestcaseService = undefined;
   solutionRecordCache.clear();
+  for (const operations of activeProblemAiOperations.values()) {
+    for (const operation of operations) {
+      cancelProblemAiOperation(operation, 'VS Code 扩展已停止，AI 任务已取消。');
+    }
+  }
+  activeProblemAiOperations.clear();
+  cancelledProblemAiFolders.clear();
   activeCaptureJobs.clear();
   supersededCaptureJobs.clear();
   activeTestcaseAiJobs.clear();

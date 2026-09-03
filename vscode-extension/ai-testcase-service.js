@@ -123,69 +123,115 @@ function readableApiError(body, apiKey) {
   return redacted(message, apiKey).replace(/\s+/g, ' ').trim().slice(0, 500);
 }
 
+function requestCancellationError(signal, fallback) {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const error = fallback instanceof Error
+    ? fallback
+    : new Error(typeof reason === 'string' && reason ? reason : 'AI 请求已取消。');
+  error.name = 'AbortError';
+  if (!error.code) error.code = 'LEETCODE_CPH_AI_CANCELLED';
+  return error;
+}
+
+function throwIfRequestAborted(signal) {
+  if (signal?.aborted) throw requestCancellationError(signal);
+}
+
+function isRequestCancellation(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ABORT_ERR'
+    || error?.code === 'LEETCODE_CPH_AI_CANCELLED';
+}
+
 // Minimal JSON POST helper instead of a third-party SDK.  It also limits the
 // response size, which avoids accepting an unexpectedly huge response from a
 // remote endpoint into extension memory.
-function postJson({ url, headers = {}, body, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+function postJson({ url, headers = {}, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal }) {
+  throwIfRequestAborted(signal);
   const target = new URL(url);
   if (target.protocol !== 'https:') throw new Error('AI 服务端点必须使用 HTTPS。');
   const payload = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     let settled = false;
+    let request;
+    const removeAbortListener = () => signal?.removeEventListener?.('abort', onAbort);
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
+      removeAbortListener();
       callback(value);
     };
-    const request = https.request({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || undefined,
-      path: `${target.pathname}${target.search}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        ...headers
-      }
-    }, (response) => {
-      const chunks = [];
-      let size = 0;
-      // A response can fail after headers arrive (for example a reset stream
-      // or a provider closing an oversized response). Handle those events on
-      // the IncomingMessage too, otherwise the request promise may never
-      // settle and the extension host can surface an unhandled stream error.
-      response.once('error', (error) => finish(reject, error));
-      response.once('aborted', () => finish(reject, new Error('AI 服务在响应完成前中断了连接。')));
-      response.on('data', (chunk) => {
-        size += chunk.length;
-        if (size > MAX_RESPONSE_CHARS) {
-          request.destroy(new Error('AI 服务响应过大。'));
-          return;
+    const onAbort = () => {
+      const error = requestCancellationError(signal);
+      request?.destroy(error);
+      finish(reject, error);
+    };
+    try {
+      request = https.request({
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          ...headers
         }
-        chunks.push(chunk);
+      }, (response) => {
+        const chunks = [];
+        let size = 0;
+        // A response can fail after headers arrive (for example a reset stream
+        // or a provider closing an oversized response). Handle those events on
+        // the IncomingMessage too, otherwise the request promise may never
+        // settle and the extension host can surface an unhandled stream error.
+        response.once('error', (error) => finish(reject, error));
+        response.once('aborted', () => finish(reject, new Error('AI 服务在响应完成前中断了连接。')));
+        response.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > MAX_RESPONSE_CHARS) {
+            request.destroy(new Error('AI 服务响应过大。'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          let parsed;
+          try {
+            parsed = raw ? JSON.parse(raw) : {};
+          } catch (_) {
+            return finish(reject, new Error(`AI 服务返回了无法解析的响应（HTTP ${response.statusCode || 0}）。`));
+          }
+          if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+            const error = new Error(`AI 服务请求失败（HTTP ${response.statusCode || 0}）。`);
+            error.statusCode = response.statusCode;
+            error.body = parsed;
+            return finish(reject, error);
+          }
+          finish(resolve, parsed);
+        });
       });
-      response.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf8');
-        let parsed;
-        try {
-          parsed = raw ? JSON.parse(raw) : {};
-        } catch (_) {
-          return finish(reject, new Error(`AI 服务返回了无法解析的响应（HTTP ${response.statusCode || 0}）。`));
-        }
-        if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
-          const error = new Error(`AI 服务请求失败（HTTP ${response.statusCode || 0}）。`);
-          error.statusCode = response.statusCode;
-          error.body = parsed;
-          return finish(reject, error);
-        }
-        finish(resolve, parsed);
-      });
-    });
+    } catch (error) {
+      finish(reject, error);
+      return;
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
     request.setTimeout(timeoutMs, () => request.destroy(new Error('AI 服务请求超时。')));
     request.on('error', (error) => finish(reject, error));
-    request.write(payload);
-    request.end();
+    try {
+      request.write(payload);
+      request.end();
+    } catch (error) {
+      request.destroy();
+      finish(reject, error);
+    }
   });
 }
 
@@ -561,7 +607,8 @@ function createAiTestcaseService({ secrets, request = postJson, defaultProvider 
   if (typeof request !== 'function') throw new TypeError('request 必须是一个异步 HTTP 请求函数。');
   const defaultProviderId = normalizeProvider(defaultProvider);
 
-  async function extractTestCases({ metadata, provider = defaultProviderId, model } = {}) {
+  async function extractTestCases({ metadata, provider = defaultProviderId, model, signal } = {}) {
+    throwIfRequestAborted(signal);
     const providerConfig = providerInfo(provider);
     const selectedModel = model == null || model === '' ? providerConfig.defaultModel : assertModel(model);
     const apiKey = await getApiKey(secrets, providerConfig.id);
@@ -586,13 +633,17 @@ function createAiTestcaseService({ secrets, request = postJson, defaultProvider 
             { role: 'system', content: 'You extract only explicit LeetCode example test cases and return valid JSON.' },
             { role: 'user', content: prompt }
           ]
-        }
+        },
+        ...(signal ? { signal } : {})
       });
     } catch (error) {
+      if (isRequestCancellation(error, signal)) throw requestCancellationError(signal, error);
       const status = error?.statusCode ? `（HTTP ${error.statusCode}）` : '';
       const detail = readableApiError(error?.body, apiKey);
       throw new Error(`调用 ${providerConfig.label} AI 提取测试用例失败${status}${detail ? `：${detail}` : '。请检查 API Key、网络和模型名称。'}`);
     }
+
+    throwIfRequestAborted(signal);
 
     const finishReason = completionFinishReason(response);
     if (finishReason && finishReason !== 'stop') {
@@ -604,7 +655,8 @@ function createAiTestcaseService({ secrets, request = postJson, defaultProvider 
     return { testCases, provider: providerConfig.id, model: selectedModel };
   }
 
-  async function generateScaffold({ metadata, solutionCode = '', testCases, operation, existingScaffold = '', provider = defaultProviderId, model } = {}) {
+  async function generateScaffold({ metadata, solutionCode = '', testCases, operation, existingScaffold = '', provider = defaultProviderId, model, signal } = {}) {
+    throwIfRequestAborted(signal);
     const providerConfig = providerInfo(provider);
     const selectedModel = model == null || model === '' ? providerConfig.defaultModel : assertModel(model);
     const apiKey = await getApiKey(secrets, providerConfig.id);
@@ -628,13 +680,17 @@ function createAiTestcaseService({ secrets, request = postJson, defaultProvider 
             { role: 'system', content: 'You generate only complete local test-scaffold source code.' },
             { role: 'user', content: prompt }
           ]
-        }
+        },
+        ...(signal ? { signal } : {})
       });
     } catch (error) {
+      if (isRequestCancellation(error, signal)) throw requestCancellationError(signal, error);
       const status = error?.statusCode ? `（HTTP ${error.statusCode}）` : '';
       const detail = readableApiError(error?.body, apiKey);
       throw new Error(`调用 ${providerConfig.label} AI 服务失败${status}${detail ? `：${detail}` : '。请检查 API Key、网络和模型名称。'}`);
     }
+
+    throwIfRequestAborted(signal);
 
     const finishReason = completionFinishReason(response);
     if (finishReason && finishReason !== 'stop') {

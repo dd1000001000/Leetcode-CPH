@@ -371,13 +371,32 @@ async function saveTestCases(problemFolder, values, options = {}) {
     excludedAiIds,
     excludedLeetCodeIds
   };
-  await fs.mkdir(path.dirname(file), { recursive: true });
+  if (options.createDirectory === false) {
+    const folderStat = await fs.lstat(path.dirname(file));
+    if (!folderStat.isDirectory() || folderStat.isSymbolicLink()) {
+      throw new Error('测试用例状态目录已被删除或替换，未写入测试用例。');
+    }
+  } else {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+  }
   // Write then rename so a VS Code crash never leaves a half-written JSON
   // document for the sidebar to parse on its next refresh.
   const temporary = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
     await fs.writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
-    await fs.rename(temporary, file);
+    const delays = [10, 25, 50, 100];
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+      try {
+        if (typeof options.beforeCommit === 'function') await options.beforeCommit();
+        await fs.rename(temporary, file);
+        break;
+      } catch (error) {
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt === delays.length) throw error;
+        // Windows antivirus/indexing can briefly hold the destination. Keep
+        // the atomic write and re-run the cancellation guard before retrying.
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
   } finally {
     await fs.unlink(temporary).catch(() => {});
   }
