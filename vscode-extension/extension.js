@@ -9,6 +9,7 @@ const { LeetCodeCphSidebarProvider } = require('./sidebar-provider');
 const {
   TEST_CASES_FILE,
   LEETCODE_SOURCE,
+  AI_SOURCE,
   mergeAiExtractedTestCases,
   loadTestCaseState,
   loadTestCases,
@@ -36,12 +37,12 @@ let outputChannel;
 let applyTracker;
 let sidebarProvider;
 let aiTestcaseService;
-let extensionStoragePath = '';
 const socketClients = new Set();
 const problemLocks = new Map();
 const solutionRecordCache = new Map();
 const activeCaptureJobs = new Set();
 const supersededCaptureJobs = new Set();
+const PROBLEM_STATE_DIRECTORY = '.leetcode_cph';
 // Per-problem reference counts prevent overlapping callers from clearing each
 // other's busy state. A regenerate request can be queued behind a mutation,
 // so a plain Set/delete pair is not sufficient ownership tracking.
@@ -111,6 +112,7 @@ function languageExtension(language) {
   if (/^(csharp|c#)\d*$/.test(normalized)) return 'cs';
   if (/^javascript\d*$/.test(normalized)) return 'js';
   if (/^typescript\d*$/.test(normalized)) return 'ts';
+  if (Object.values(EXTENSIONS).includes(normalized)) return normalized;
   return EXTENSIONS[normalized] || 'txt';
 }
 
@@ -145,32 +147,11 @@ function workspaceFolderForPath(filePath) {
     .sort((left, right) => right.path.length - left.path.length)[0];
 }
 
-function initializeExtensionStorage(context) {
-  const workspaceSpecific = context?.storageUri?.fsPath;
-  if (workspaceSpecific) {
-    extensionStoragePath = path.resolve(workspaceSpecific);
-  } else {
-    const globalRoot = context?.globalStorageUri?.fsPath;
-    const root = workspaceRoot();
-    // A real ExtensionContext always provides globalStorageUri. The fallback
-    // keeps lightweight extension-host tests and compatible hosts functional
-    // without ever placing private state inside the user's workspace.
-    if (!globalRoot) {
-      if (!root) throw new Error('当前窗口没有可用的工作区私有存储。请先打开文件夹并重新加载 VS Code。');
-      const environment = typeof process === 'object' && process?.env ? process.env : {};
-      const temporaryRoot = environment.TEMP || environment.TMP || environment.TMPDIR || path.dirname(root);
-      const fallbackKey = crypto.createHash('sha256').update(pathKey(root)).digest('hex').slice(0, 32);
-      extensionStoragePath = path.join(temporaryRoot, 'leetcode-cph-private', fallbackKey);
-      solutionRecordCache.clear();
-      return extensionStoragePath;
-    }
-    const workspaceKey = root
-      ? crypto.createHash('sha256').update(pathKey(root)).digest('hex').slice(0, 32)
-      : 'empty-window';
-    extensionStoragePath = path.join(globalRoot, 'workspaces', workspaceKey);
-  }
+function initializeProblemStorage() {
+  // Problem state is intentionally workspace-local.  Do not inspect or
+  // migrate ExtensionContext.storageUri/globalStorageUri records written by
+  // older releases: only a sibling .leetcode_cph directory is authoritative.
   solutionRecordCache.clear();
-  return extensionStoragePath;
 }
 
 function config() {
@@ -189,6 +170,20 @@ function resolveWorkspaceOutputDirectory(root, configuredDirectory) {
   return resolved;
 }
 
+async function assertSafeWorkspaceOutputDirectory(root, outputDirectory) {
+  const [rootReal, outputStat, outputReal] = await Promise.all([
+    fs.realpath(root).catch(() => path.resolve(root)),
+    fs.lstat(outputDirectory),
+    fs.realpath(outputDirectory)
+  ]);
+  if (outputStat.isSymbolicLink() || !outputStat.isDirectory()) {
+    throw new Error('LeetCode CPH 输出目录不能是符号链接或普通文件。');
+  }
+  if (!isPathInside(rootReal, outputReal)) {
+    throw new Error('LeetCode CPH 输出目录指向工作区外部，已拒绝写入。');
+  }
+}
+
 function captureProblemSlug(payload) {
   try {
     const fromUrl = new URL(String(payload?.source || payload?.problemUrl || '')).pathname
@@ -198,60 +193,17 @@ function captureProblemSlug(payload) {
   return String(payload?.problemSlug || '').trim().toLowerCase();
 }
 
-async function captureProblemFolder(base, payload) {
-  const problemSlug = captureProblemSlug(payload);
-
-  // Reuse directories created by older versions (for example
-  // `1-two-sum`) so the stable slug migration does not split one problem
-  // across two folders. Metadata is authoritative; folder names are not.
-  let entries = [];
-  try {
-    entries = await fs.readdir(base, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-  const matches = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = path.join(base, entry.name);
-    try {
-      const metadata = JSON.parse(await fs.readFile(path.join(candidate, 'metadata.json'), 'utf8'));
-      if (captureProblemSlug(metadata) === problemSlug) {
-        matches.push({ folder: candidate, savedAt: Date.parse(metadata.savedAt || metadata.capturedAt || 0) || 0 });
-      }
-    } catch (_) { /* An unrelated/corrupt directory is not a match. */ }
-  }
-  matches.sort((left, right) => right.savedAt - left.savedAt || left.folder.localeCompare(right.folder));
-  // A directory name alone is never proof of identity. It may be a user's
-  // unrelated folder or a stale directory whose metadata belongs to another
-  // problem, so only matching metadata is eligible for migration.
-  return matches[0]?.folder || '';
-}
-
 function isPathInside(parent, candidate) {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-function requireExtensionStoragePath() {
-  if (!extensionStoragePath) {
-    throw new Error('LeetCode CPH 私有存储尚未初始化，请重新加载 VS Code 窗口。');
-  }
-  return extensionStoragePath;
-}
-
-function captureRecordKey(payload, extension) {
-  const identity = captureProblemSlug(payload) || String(payload?.title || 'untitled-problem').trim().toLowerCase();
-  return crypto.createHash('sha256').update(`${identity}\0${extension}`).digest('hex').slice(0, 32);
-}
-
-function captureStorageFolder(payload, extension) {
-  return path.join(requireExtensionStoragePath(), 'problems', captureRecordKey(payload, extension));
+function problemStateFolder(problemDirectory) {
+  return path.join(path.resolve(problemDirectory), PROBLEM_STATE_DIRECTORY);
 }
 
 function localStateFolderForSolution(solutionPath) {
-  const identity = crypto.createHash('sha256').update(pathKey(solutionPath)).digest('hex').slice(0, 32);
-  return path.join(requireExtensionStoragePath(), 'local-problems', identity);
+  return problemStateFolder(path.dirname(solutionPath));
 }
 
 function captureJobKey(problemFolder, captureRevision) {
@@ -288,29 +240,141 @@ function reservedSolutionFileName(filePath) {
   return /^(?:main|testcase)\.[^.]+$/i.test(path.basename(String(filePath || '')));
 }
 
-function metadataSolutionPath(metadata) {
-  const roots = workspaceFolders();
-  const absolute = String(metadata?.solutionPath || '').trim();
-  if (absolute) {
-    const resolved = path.resolve(absolute);
-    if (!roots.length || roots.some((root) => isPathInside(root.path, resolved))) return resolved;
+function metadataSolutionPath(metadata, stateFolder) {
+  if (!stateFolder || path.basename(path.resolve(stateFolder)) !== PROBLEM_STATE_DIRECTORY) return '';
+  const problemDirectory = path.dirname(path.resolve(stateFolder));
+  const workspace = workspaceFolderForPath(problemDirectory);
+  if (!workspace) return '';
+  const fileName = String(metadata?.solutionFileName || '').trim();
+  const expectedExtension = languageExtension(metadata?.language);
+  if (!/^solution\.[^.]+$/i.test(fileName)
+    || fileName !== path.basename(fileName)
+    || path.extname(fileName).slice(1).toLowerCase() !== expectedExtension) return '';
+  const candidate = path.join(problemDirectory, fileName);
+  return pathKey(path.dirname(candidate)) === pathKey(problemDirectory) && isPathInside(workspace.path, candidate)
+    ? candidate
+    : '';
+}
+
+async function assertSafeProblemStateFolder(stateFolder, { create = false } = {}) {
+  const resolved = path.resolve(stateFolder);
+  if (path.basename(resolved) !== PROBLEM_STATE_DIRECTORY) {
+    throw new Error('题目状态目录必须命名为 .leetcode_cph。');
+  }
+  const problemDirectory = path.dirname(resolved);
+  const workspace = workspaceFolderForPath(problemDirectory);
+  if (!workspace) throw new Error('.leetcode_cph 必须位于当前工作区的题目文件夹内。');
+
+  // Lexical checks are not enough when a workspace contains directory links.
+  // Resolve the existing parent so a crafted symlink cannot redirect metadata,
+  // testcase, or backup writes outside the workspace.
+  const [workspaceReal, problemStat, problemReal] = await Promise.all([
+    fs.realpath(workspace.path).catch(() => path.resolve(workspace.path)),
+    fs.lstat(problemDirectory),
+    fs.realpath(problemDirectory).catch(() => path.resolve(problemDirectory))
+  ]);
+  if (problemStat.isSymbolicLink() || !problemStat.isDirectory()) {
+    throw new Error('题目文件夹不能是符号链接或普通文件。');
+  }
+  if (!isPathInside(workspaceReal, problemReal)) {
+    throw new Error('题目文件夹指向工作区外部，已拒绝读写 .leetcode_cph。');
   }
 
-  const relative = String(metadata?.solutionRelativePath || '').trim();
-  if (!relative) return '';
-  const storedRootPath = String(metadata?.workspaceRootPath || '').trim();
-  const storedRootUri = String(metadata?.workspaceFolderUri || '').trim();
-  let root = storedRootUri ? roots.find((candidate) => candidate.uri === storedRootUri) : undefined;
-  if (!root && storedRootPath) {
-    root = roots.find((candidate) => pathKey(candidate.path) === pathKey(storedRootPath));
+  let stat;
+  try {
+    stat = await fs.lstat(resolved);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    if (!create) return false;
+    await fs.mkdir(resolved, { recursive: true });
+    stat = await fs.lstat(resolved);
   }
-  // Records written before workspace identity was persisted are safe to
-  // reinterpret only when the window contains a single folder. In a
-  // multi-root workspace the same relative filename can exist in every root.
-  if (!root && !storedRootPath && !storedRootUri && roots.length === 1) root = roots[0];
-  if (!root) return '';
-  const resolved = path.resolve(root.path, relative);
-  return isPathInside(root.path, resolved) ? resolved : '';
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error('.leetcode_cph 不能是符号链接或普通文件。');
+  }
+  const stateReal = await fs.realpath(resolved).catch(() => resolved);
+  if (!isPathInside(problemReal, stateReal)) {
+    throw new Error('.leetcode_cph 指向题目文件夹外部，已拒绝访问。');
+  }
+  const backupsFolder = path.join(resolved, 'backups');
+  try {
+    const backupsStat = await fs.lstat(backupsFolder);
+    if (backupsStat.isSymbolicLink() || !backupsStat.isDirectory()) {
+      throw new Error('.leetcode_cph/backups 不能是符号链接或普通文件。');
+    }
+    const backupsReal = await fs.realpath(backupsFolder);
+    if (!isPathInside(stateReal, backupsReal)) {
+      throw new Error('.leetcode_cph/backups 指向题目状态目录外部，已拒绝访问。');
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  for (const fileName of ['metadata.json', TEST_CASES_FILE]) {
+    const filePath = path.join(resolved, fileName);
+    try {
+      const fileStat = await fs.lstat(filePath);
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        throw new Error(`${fileName} 不能是符号链接或目录。`);
+      }
+      if (fileStat.size > 4_000_000) {
+        throw new Error(`${fileName} 过大，已拒绝读取。`);
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return true;
+}
+
+async function assertSafeProblemArtifact(stateFolder, artifactPath, { allowMissing = true } = {}) {
+  await assertSafeProblemStateFolder(stateFolder);
+  const problemDirectory = path.dirname(path.resolve(stateFolder));
+  const resolved = path.resolve(artifactPath);
+  if (pathKey(path.dirname(resolved)) !== pathKey(problemDirectory)) {
+    throw new Error('solution/main 必须直接位于对应题目文件夹内。');
+  }
+  let stat;
+  try {
+    stat = await fs.lstat(resolved);
+  } catch (error) {
+    if (error?.code === 'ENOENT' && allowMissing) return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${path.basename(resolved)} 不能是符号链接或目录。`);
+  }
+  const [problemReal, artifactReal] = await Promise.all([
+    fs.realpath(problemDirectory),
+    fs.realpath(resolved)
+  ]);
+  if (!isPathInside(problemReal, artifactReal)) {
+    throw new Error(`${path.basename(resolved)} 指向题目文件夹外部，已拒绝访问。`);
+  }
+  return true;
+}
+
+async function createProblemBackupFolder(stateFolder) {
+  await assertSafeProblemStateFolder(stateFolder);
+  const backupsRoot = path.join(path.resolve(stateFolder), 'backups');
+  try {
+    await fs.mkdir(backupsRoot);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  // Revalidate after mkdir so a pre-existing junction/symlink cannot be used
+  // as the parent of files containing solution code or problem metadata.
+  await assertSafeProblemStateFolder(stateFolder);
+  const backupFolder = path.join(backupsRoot, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`);
+  await fs.mkdir(backupFolder);
+  const [stateReal, backupReal, backupStat] = await Promise.all([
+    fs.realpath(stateFolder),
+    fs.realpath(backupFolder),
+    fs.lstat(backupFolder)
+  ]);
+  if (backupStat.isSymbolicLink() || !backupStat.isDirectory() || !isPathInside(stateReal, backupReal)) {
+    throw new Error('无法在 .leetcode_cph 内安全创建备份目录。');
+  }
+  return backupFolder;
 }
 
 function cacheSolutionRecord(solutionPath, problemFolder) {
@@ -330,84 +394,82 @@ function clearCachedProblemFolder(problemFolder) {
 }
 
 async function listStoredProblemRecords() {
-  if (!extensionStoragePath) return [];
-
-  const recordsRoot = path.join(extensionStoragePath, 'problems');
-  let entries = [];
-  try {
-    entries = await fs.readdir(recordsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') return [];
-    throw error;
-  }
-  const records = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const folder = path.join(recordsRoot, entry.name);
+  const stateFolders = new Map();
+  let configuredDirectory = 'leetcode';
+  try { configuredDirectory = config().outputDirectory || configuredDirectory; } catch (_) { /* Use the default in lightweight hosts. */ }
+  for (const workspace of workspaceFolders()) {
+    let base;
+    try { base = resolveWorkspaceOutputDirectory(workspace.path, configuredDirectory); } catch (_) { continue; }
+    let entries = [];
     try {
+      await assertSafeWorkspaceOutputDirectory(workspace.path, base);
+      entries = await fs.readdir(base, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const folder = problemStateFolder(path.join(base, entry.name));
+      stateFolders.set(pathKey(folder), folder);
+    }
+  }
+  for (const folder of solutionRecordCache.values()) {
+    stateFolders.set(pathKey(folder), path.resolve(folder));
+  }
+  const activePath = vscode.window?.activeTextEditor?.document?.uri?.scheme === 'file'
+    ? vscode.window.activeTextEditor.document.uri.fsPath
+    : '';
+  if (activePath) {
+    const folder = problemStateFolder(path.dirname(activePath));
+    stateFolders.set(pathKey(folder), folder);
+  }
+
+  const records = [];
+  for (const folder of stateFolders.values()) {
+    try {
+      if (!await assertSafeProblemStateFolder(folder)) continue;
       const metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
-      const recordedSolution = metadataSolutionPath(metadata);
-      if (!recordedSolution) continue;
+      if (metadata?.storageLayout !== 'workspace-sidecar' || metadata?.localOnly || !isLeetCodeProblemUrl(metadata?.source)) continue;
+      if (Number(metadata?.storageSchemaVersion) !== 3) continue;
+      const recordedSolution = metadataSolutionPath(metadata, folder);
+      if (!recordedSolution || pathKey(problemStateFolder(path.dirname(recordedSolution))) !== pathKey(folder)) continue;
       records.push({ folder, metadata, solutionPath: recordedSolution });
     } catch (_) { /* Ignore incomplete records; another capture can repair them. */ }
   }
   return records;
 }
 
-async function storedRecordOwnsSolution(problemFolder, solutionPath) {
-  if (!extensionStoragePath || !problemFolder || !solutionPath) return false;
-  const recordsRoot = path.resolve(extensionStoragePath, 'problems');
-  const folder = path.resolve(problemFolder);
-  if (pathKey(path.dirname(folder)) !== pathKey(recordsRoot)) return false;
-  try {
-    const metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
-    const recordedSolution = metadataSolutionPath(metadata);
-    return Boolean(recordedSolution && pathKey(recordedSolution) === pathKey(solutionPath));
-  } catch (_) {
-    return false;
-  }
-}
-
 async function storedRecordOwnsArtifact(problemFolder, artifactPath) {
-  if (!extensionStoragePath || !problemFolder || !artifactPath) return false;
-  const recordsRoot = path.resolve(extensionStoragePath, 'problems');
+  if (!problemFolder || !artifactPath) return false;
   const folder = path.resolve(problemFolder);
-  if (pathKey(path.dirname(folder)) !== pathKey(recordsRoot)) return false;
   try {
+    if (!await assertSafeProblemStateFolder(folder)) return false;
     const metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
-    const solution = metadataSolutionPath(metadata);
+    if (Number(metadata?.storageSchemaVersion) !== 3 || metadata?.storageLayout !== 'workspace-sidecar'
+      || metadata?.localOnly || !isLeetCodeProblemUrl(metadata?.source)) return false;
+    const solution = metadataSolutionPath(metadata, folder);
     if (!solution) return false;
     const artifact = path.resolve(artifactPath);
-    if (pathKey(artifact) === pathKey(solution)) return true;
+    if (pathKey(artifact) === pathKey(solution)) {
+      return Boolean(await assertSafeProblemArtifact(folder, solution, { allowMissing: false }));
+    }
     const expectedMain = path.join(path.dirname(solution), `main${path.extname(solution)}`);
-    return pathKey(artifact) === pathKey(expectedMain);
+    return pathKey(artifact) === pathKey(expectedMain)
+      && Boolean(await assertSafeProblemArtifact(folder, expectedMain, { allowMissing: false }));
   } catch (_) {
     return false;
   }
-}
-
-async function findStoredProblemFolderBySolution(solutionPath) {
-  const key = pathKey(solutionPath);
-  const cached = solutionRecordCache.get(key);
-  if (cached) {
-    if (await storedRecordOwnsSolution(cached, solutionPath)) return cached;
-    solutionRecordCache.delete(key);
-  }
-  const records = await listStoredProblemRecords();
-  for (const record of records) {
-    if (pathKey(record.solutionPath) !== key) continue;
-    // Revalidate after the scan. A same-title capture can move a record to the
-    // private overwrite archive while this asynchronous directory walk is in
-    // progress; such a stale result must never be put back into the cache.
-    if (!await storedRecordOwnsSolution(record.folder, solutionPath)) continue;
-    cacheSolutionRecord(solutionPath, record.folder);
-    return record.folder;
-  }
-  return '';
 }
 
 async function findStoredProblemFolderByArtifact(artifactPath) {
   const key = pathKey(artifactPath);
+  const colocated = problemStateFolder(path.dirname(artifactPath));
+  if (await storedRecordOwnsArtifact(colocated, artifactPath)) {
+    const metadata = JSON.parse(await fs.readFile(path.join(colocated, 'metadata.json'), 'utf8'));
+    cacheSolutionRecord(metadataSolutionPath(metadata, colocated), colocated);
+    return colocated;
+  }
   const cached = solutionRecordCache.get(key);
   if (cached) {
     if (await storedRecordOwnsArtifact(cached, artifactPath)) return cached;
@@ -434,63 +496,9 @@ async function findStoredProblemFolderByArtifact(artifactPath) {
   return '';
 }
 
-async function storedProblemFoldersForDirectory(problemDirectory) {
-  const directoryKey = pathKey(problemDirectory);
-  const records = await listStoredProblemRecords();
-  return records
-    .filter((record) => pathKey(path.dirname(record.solutionPath)) === directoryKey)
-    .sort((left, right) => {
-      const rightTime = Date.parse(right.metadata?.savedAt || right.metadata?.capturedAt || 0) || 0;
-      const leftTime = Date.parse(left.metadata?.savedAt || left.metadata?.capturedAt || 0) || 0;
-      return rightTime - leftTime || left.folder.localeCompare(right.folder);
-    });
-}
-
 function primaryProblemDirectory(base, payload) {
   const stem = problemFileStem(payload?.title, captureProblemSlug(payload) || 'LeetCode Problem');
   return path.join(base, stem);
-}
-
-function primarySolutionPath(base, payload, extension) {
-  return path.join(primaryProblemDirectory(base, payload), `solution.${extension}`);
-}
-
-async function visibleSolutionPath(base, payload, extension, previousMetadata = {}, currentProblemFolder = '') {
-  const primary = primarySolutionPath(base, payload, extension);
-  const primaryDirectory = path.dirname(primary);
-  const primaryOwners = await storedProblemFoldersForDirectory(primaryDirectory);
-  const primaryOwner = primaryOwners[0]?.folder || '';
-  const previous = metadataSolutionPath(previousMetadata);
-  // A different registered problem already owns this title directory. The
-  // user's collision policy is last capture wins, including across languages,
-  // so claim the canonical directory instead of creating a slug suffix.
-  if (primaryOwner && (!currentProblemFolder || pathKey(primaryOwner) !== pathKey(currentProblemFolder))) {
-    return primary;
-  }
-  if (Number(previousMetadata.storageSchemaVersion) >= 2
-    && previous
-    && workspaceFolderForPath(previous)
-    && /^solution\.[^.]+$/i.test(path.basename(previous))
-    && path.extname(previous).toLowerCase() === `.${extension}`.toLowerCase()) {
-    return previous;
-  }
-
-  if (!await fileExists(primaryDirectory)) return primary;
-  if (primaryOwner) return primary;
-
-  // An unregistered directory may be ordinary user data. Preserve the entire
-  // directory; the overwrite rule applies only when a private ownership record
-  // proves it came from this extension.
-  const stem = problemFileStem(payload?.title, captureProblemSlug(payload) || 'LeetCode Problem');
-  const identitySuffix = problemFileStem(captureProblemSlug(payload), 'leetcode').slice(0, 48);
-  const alternateDirectory = path.join(base, `${stem} (${identitySuffix})`);
-  const alternate = path.join(alternateDirectory, `solution.${extension}`);
-  if (!await fileExists(alternateDirectory)) return alternate;
-  for (let index = 2; index < 10_000; index += 1) {
-    const candidateDirectory = path.join(base, `${stem} (${identitySuffix} ${index})`);
-    if (!await fileExists(candidateDirectory)) return path.join(candidateDirectory, `solution.${extension}`);
-  }
-  throw new Error('无法为题目创建唯一的目录名称。');
 }
 
 function aiConfig() {
@@ -504,7 +512,7 @@ function aiConfig() {
 // double-click, an AI rollback, or a re-capture cannot overwrite another
 // operation's testcases.json or visible main.* file.
 function withProblemLock(problemFolder, operation) {
-  const key = path.resolve(problemFolder);
+  const key = pathKey(problemFolder);
   const previous = problemLocks.get(key) || Promise.resolve();
   let release;
   const current = new Promise((resolve) => { release = resolve; });
@@ -517,47 +525,6 @@ function withProblemLock(problemFolder, operation) {
       if (problemLocks.get(key) === current) problemLocks.delete(key);
     }
   });
-}
-
-function withProblemLocks(problemFolders, operation) {
-  const folders = [...new Map(
-    (problemFolders || []).filter(Boolean).map((folder) => [pathKey(folder), path.resolve(folder)])
-  ).values()].sort((left, right) => pathKey(left).localeCompare(pathKey(right)));
-  const acquire = (index) => index >= folders.length
-    ? operation()
-    : withProblemLock(folders[index], () => acquire(index + 1));
-  return acquire(0);
-}
-
-async function archiveOverwrittenProblemRecord(problemFolder) {
-  if (!problemFolder) return '';
-  const recordsRoot = path.resolve(requireExtensionStoragePath(), 'problems');
-  const resolved = path.resolve(problemFolder);
-  if (pathKey(path.dirname(resolved)) !== pathKey(recordsRoot)) {
-    throw new Error('拒绝覆盖私有存储范围外的题目记录。');
-  }
-  const archiveRoot = path.join(requireExtensionStoragePath(), 'overwritten');
-  await fs.mkdir(archiveRoot, { recursive: true });
-  const suffix = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
-  const destination = path.join(archiveRoot, `${path.basename(resolved)}-${suffix}`);
-  let captureRevision = '';
-  try {
-    const metadata = JSON.parse(await fs.readFile(path.join(resolved, 'metadata.json'), 'utf8'));
-    captureRevision = String(metadata?.captureRevision || '');
-  } catch (_) { /* An incomplete record can still be archived safely. */ }
-  try {
-    await fs.rename(resolved, destination);
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      clearCachedProblemFolder(resolved);
-      return '';
-    }
-    throw error;
-  }
-  clearCachedProblemFolder(resolved);
-  const jobKey = captureRevision ? captureJobKey(resolved, captureRevision) : '';
-  if (jobKey && activeCaptureJobs.has(jobKey)) supersededCaptureJobs.add(jobKey);
-  return destination;
 }
 
 function isLeetCodeProblemUrl(value) {
@@ -628,8 +595,8 @@ async function extractCapturedTestCases(payload) {
   } catch (error) {
     // Saving a problem must not fail merely because the optional remote AI
     // request is unavailable. A fresh capture remains empty (rather than
-    // falling back to the old brittle DOM parser); existing AI/manual cases
-    // are preserved until the user retries extraction.
+    // falling back to the old brittle DOM parser). A browser capture starts
+    // from an empty replacement record, so prior cases are never restored.
     const message = String(error?.message || 'AI 提取测试用例失败。').slice(0, 800);
     outputChannel?.appendLine(`AI testcase extraction failed: ${message}`);
     return {
@@ -648,86 +615,58 @@ async function saveCapture(payload) {
   const settings = config();
   const base = resolveWorkspaceOutputDirectory(root, settings.outputDirectory);
   const extension = languageExtension(payload.language);
-  const folder = captureStorageFolder(payload, extension);
+  const workspaceProblemFolder = primaryProblemDirectory(base, payload);
+  const solution = path.join(workspaceProblemFolder, `solution.${extension}`);
+  const main = path.join(workspaceProblemFolder, `main.${extension}`);
+  const folder = problemStateFolder(workspaceProblemFolder);
   const metadata = path.join(folder, 'metadata.json');
-  const captureCoordinator = path.join(requireExtensionStoragePath(), '.capture-coordinator');
-  const saved = await withProblemLock(captureCoordinator, async () => {
-    // Queue the capture before the first asynchronous filesystem/configuration
-    // operation. This preserves request order and prevents another same-title
-    // capture from archiving this record between mkdir and the actual commit.
-    await Promise.all([fs.mkdir(base, { recursive: true }), fs.mkdir(folder, { recursive: true })]);
+  const testCasesPath = path.join(folder, TEST_CASES_FILE);
+
+  // The title directory is the record identity in the workspace-local layout.
+  // Titles that normalize to the same path intentionally serialize and replace
+  // the same registered files, while unrelated files in that directory remain.
+  const saved = await withProblemLock(folder, async () => {
+    await fs.mkdir(base, { recursive: true });
+    await assertSafeWorkspaceOutputDirectory(root, base);
+    await fs.mkdir(workspaceProblemFolder, { recursive: true });
+    await assertSafeProblemStateFolder(folder, { create: true });
+
     let ai = { provider: 'glm', model: '', configured: false };
     try {
       ai = await configuredAiState();
     } catch (error) {
       outputChannel?.appendLine(`Could not read AI configuration during capture: ${error.message}`);
     }
-    const registeredPrimaryOwners = await storedProblemFoldersForDirectory(
-      primaryProblemDirectory(base, payload)
-    );
-    return withProblemLocks([folder, ...registeredPrimaryOwners.map((record) => record.folder)], async () => {
-    let previousMetadata = {};
-    let previousState;
-    let legacyFolder = '';
+
     const metadataSnapshot = await snapshotFile(metadata);
-    const testCasesPath = path.join(folder, TEST_CASES_FILE);
     const testCasesSnapshot = await snapshotFile(testCasesPath);
+    let storedMetadata = {};
     try {
-      if (metadataSnapshot.exists) previousMetadata = JSON.parse(metadataSnapshot.content.toString('utf8'));
-    } catch (_) { /* A fresh/corrupt private record is replaced below. */ }
+      if (metadataSnapshot.exists) storedMetadata = JSON.parse(metadataSnapshot.content.toString('utf8'));
+    } catch (_) { /* Corrupt sidecar state is backed up and replaced. */ }
 
-    if (previousMetadata?.source) {
-      previousState = await loadSanitizedTestCaseState(folder);
-    } else {
-      // Lazy, non-destructive migration for captures made by older versions.
-      // Generated state is copied into VS Code private storage; the legacy
-      // directory is deliberately left untouched so unknown/user files cannot
-      // be deleted by an automatic upgrade.
-      const candidate = await captureProblemFolder(base, payload);
-      if (candidate && await fileExists(path.join(candidate, 'metadata.json'))) {
-        let candidateMetadata = {};
-        try { candidateMetadata = JSON.parse(await fs.readFile(path.join(candidate, 'metadata.json'), 'utf8')); } catch (_) { /* Ignore corrupt legacy state. */ }
-        // Defend again at the point where files are copied. Folder names are
-        // user-controlled and must never cause one problem's cases to be
-        // imported into another problem's private record.
-        if (captureProblemSlug(candidateMetadata) !== captureProblemSlug(payload)) {
-          outputChannel?.appendLine(`Skipped mismatched legacy testcase state in ${candidate}.`);
-        } else {
-          legacyFolder = candidate;
-          previousMetadata = candidateMetadata;
-        }
-      }
-      if (legacyFolder) {
-        try {
-          const legacyState = await loadTestCaseState(legacyFolder);
-          previousState = { ...legacyState, testCases: withoutLegacyRawTestCases(legacyState.testCases) };
-        } catch (error) {
-          outputChannel?.appendLine(`Could not migrate legacy testcase state from ${legacyFolder}: ${error.message}`);
-        }
-        const legacyScaffold = path.join(legacyFolder, `testcase.${extension}`);
-        const privateScaffoldBackup = path.join(folder, `main.${extension}.legacy.bak`);
-        if (await fileExists(legacyScaffold) && !await fileExists(privateScaffoldBackup)) {
-          // Old generated code targets the old directory contract. Preserve it
-          // for recovery, but never present or execute it as the new main file.
-          await writeFileAtomically(privateScaffoldBackup, await fs.readFile(legacyScaffold, 'utf8'));
-        }
-      }
-    }
-    if (!previousState) previousState = await loadSanitizedTestCaseState(folder);
+    const candidateCurrentState = Number(storedMetadata?.storageSchemaVersion) === 3
+      && storedMetadata?.storageLayout === 'workspace-sidecar';
+    const candidateOwnedState = candidateCurrentState
+      && (isLeetCodeProblemUrl(storedMetadata?.source) || storedMetadata?.localOnly === true);
+    const previousRegisteredSolution = candidateOwnedState
+      ? metadataSolutionPath(storedMetadata, folder)
+      : '';
+    const registeredState = Boolean(previousRegisteredSolution);
+    const sameProblem = registeredState
+      && storedMetadata?.localOnly !== true
+      && captureProblemSlug(storedMetadata) === captureProblemSlug(payload)
+      && languageExtension(storedMetadata.language) === extension;
+    // A browser capture is an explicit replacement of this title record. Old
+    // AI/manual cases and every deletion tombstone remain available only in
+    // the backup snapshot; the new revision starts with an empty testcase set.
+    const testCases = [];
 
-    const solution = await visibleSolutionPath(base, payload, extension, previousMetadata, folder);
-    const workspaceProblemFolder = path.dirname(solution);
-    const main = path.join(workspaceProblemFolder, `main.${extension}`);
-    await fs.mkdir(workspaceProblemFolder, { recursive: true });
-
-    const collisionRecords = (await storedProblemFoldersForDirectory(workspaceProblemFolder))
-      .filter((record) => pathKey(record.folder) !== pathKey(folder));
-    const previousRegisteredSolution = metadataSolutionPath(previousMetadata);
     const obsoleteCurrentSolution = previousRegisteredSolution
       && pathKey(previousRegisteredSolution) !== pathKey(solution)
       ? previousRegisteredSolution
       : '';
-    const obsoleteCurrentMain = obsoleteCurrentSolution && Number(previousMetadata.storageSchemaVersion) >= 2
+    const obsoleteCurrentMain = obsoleteCurrentSolution
       ? path.join(path.dirname(obsoleteCurrentSolution), `main${path.extname(obsoleteCurrentSolution)}`)
       : '';
 
@@ -735,16 +674,15 @@ async function saveCapture(payload) {
     const rememberSnapshot = async (filePath) => {
       if (!filePath) return;
       const key = pathKey(filePath);
-      if (!pathsToSnapshot.has(key)) pathsToSnapshot.set(key, { filePath, snapshot: await snapshotFile(filePath) });
+      if (!pathsToSnapshot.has(key)) {
+        await assertSafeProblemArtifact(folder, filePath);
+        pathsToSnapshot.set(key, { filePath, snapshot: await snapshotFile(filePath) });
+      }
     };
     await rememberSnapshot(solution);
     await rememberSnapshot(main);
     await rememberSnapshot(obsoleteCurrentSolution);
     await rememberSnapshot(obsoleteCurrentMain);
-    for (const record of collisionRecords) {
-      await rememberSnapshot(record.solutionPath);
-      await rememberSnapshot(path.join(path.dirname(record.solutionPath), `main${path.extname(record.solutionPath)}`));
-    }
 
     for (const { filePath, snapshot } of pathsToSnapshot.values()) {
       if (snapshot.exists && openTextDocument(filePath)?.isDirty) {
@@ -757,60 +695,30 @@ async function saveCapture(payload) {
     const solutionCreated = !solutionSnapshot.exists;
     const previousSolution = solutionSnapshot.exists ? solutionSnapshot.content.toString('utf8') : '';
     const solutionChanged = !solutionCreated && previousSolution !== payload.code;
-    const isRegisteredCollision = collisionRecords.length > 0;
-    let solutionBackup = '';
-    if (!isRegisteredCollision && solutionChanged) {
-      solutionBackup = path.join(folder, `solution.${extension}.bak`);
-      await writeFileAtomically(solutionBackup, previousSolution);
-    }
-    if (obsoleteCurrentSolution) {
-      const snapshot = pathsToSnapshot.get(pathKey(obsoleteCurrentSolution))?.snapshot;
-      if (snapshot?.exists) {
-        solutionBackup = path.join(folder, `solution.${path.extname(obsoleteCurrentSolution).slice(1) || extension}.layout.bak`);
-        await writeFileAtomically(solutionBackup, snapshot.content);
+    const replacesRegisteredProblem = registeredState && !sameProblem;
+    const hasPriorState = metadataSnapshot.exists || testCasesSnapshot.exists;
+    const hasPriorArtifacts = solutionSnapshot.exists || mainSnapshot.exists
+      || pathsToSnapshot.get(pathKey(obsoleteCurrentSolution))?.snapshot.exists
+      || pathsToSnapshot.get(pathKey(obsoleteCurrentMain))?.snapshot.exists;
+    const backupFolder = hasPriorState || hasPriorArtifacts
+      ? await createProblemBackupFolder(folder)
+      : '';
+    if (backupFolder) {
+      const backupSnapshots = new Map([
+        ['record-metadata.json', metadataSnapshot],
+        ['record-testcases.json', testCasesSnapshot]
+      ]);
+      for (const { filePath, snapshot } of pathsToSnapshot.values()) {
+        if (snapshot.exists) backupSnapshots.set(path.basename(filePath), snapshot);
+      }
+      for (const [name, snapshot] of backupSnapshots) {
+        if (snapshot.exists) await writeFileAtomically(path.join(backupFolder, name), snapshot.content);
       }
     }
-    if (obsoleteCurrentMain) {
-      const snapshot = pathsToSnapshot.get(pathKey(obsoleteCurrentMain))?.snapshot;
-      if (snapshot?.exists) {
-        await writeFileAtomically(
-          path.join(folder, `main.${path.extname(obsoleteCurrentMain).slice(1) || extension}.layout.bak`),
-          snapshot.content
-        );
-      }
-    }
+    const solutionBackup = solutionChanged && solutionSnapshot.exists
+      ? path.join(backupFolder, path.basename(solution))
+      : '';
 
-    // Preserve every known artifact of the outgoing registered owner before
-    // its active record is archived. Unknown files in the title directory are
-    // never touched.
-    for (const record of collisionRecords) {
-      const ownerSolution = pathsToSnapshot.get(pathKey(record.solutionPath));
-      const ownerMainPath = path.join(path.dirname(record.solutionPath), `main${path.extname(record.solutionPath)}`);
-      const ownerMain = pathsToSnapshot.get(pathKey(ownerMainPath));
-      const ownerExtension = path.extname(record.solutionPath).slice(1) || 'txt';
-      if (ownerSolution?.snapshot.exists) {
-        await writeFileAtomically(path.join(record.folder, `solution.${ownerExtension}.overwritten.bak`), ownerSolution.snapshot.content);
-      }
-      if (ownerMain?.snapshot.exists) {
-        await writeFileAtomically(path.join(record.folder, `main.${ownerExtension}.overwritten.bak`), ownerMain.snapshot.content);
-      }
-    }
-
-    const capturedCodeChanged = typeof previousMetadata.code === 'string'
-      && previousMetadata.code !== payload.code;
-    if (solutionCreated && legacyFolder) {
-      const legacySolution = path.join(legacyFolder, `solution.${extension}`);
-      if (await fileExists(legacySolution)) {
-        const legacyCode = await fs.readFile(legacySolution, 'utf8');
-        if (legacyCode !== payload.code) {
-          await writeFileAtomically(path.join(folder, `solution.${extension}.legacy.bak`), legacyCode);
-        }
-      }
-    }
-
-    const testCases = previousState.testCases;
-    // A main file in a directory owned by another problem is never inherited.
-    const hasScaffold = mainSnapshot.exists && !isRegisteredCollision;
     const captureRevision = crypto.randomUUID();
     const extraction = ai.configured
       ? {
@@ -821,20 +729,23 @@ async function saveCapture(payload) {
           status: 'not-configured', provider: ai.provider, model: ai.model,
           message: `未配置 ${providerInfo(ai.provider).label} API Key，因此未生成测试用例。`
         };
-    // A generated scaffold can contain language-specific imports and wrappers
-    // around the captured solution. Re-capturing different browser code must
-    // invalidate it even when AI later extracts the exact same testcases.
-    const scaffoldStale = Boolean(legacyFolder) || (hasScaffold
-      && (Boolean(previousMetadata.testcaseScaffoldStale) || solutionChanged || capturedCodeChanged));
+    // Every browser capture removes the old main entry point and regenerates it
+    // from the current solution/cases. This prevents a stale scaffold from a
+    // previous capture (or a different same-title problem) from being runnable.
+    const scaffoldStale = false;
     const metadataDocument = {
-      ...payload,
-      storageSchemaVersion: 2,
+      source: payload.source,
+      problemSlug: captureProblemSlug(payload),
+      problemUrl: payload.problemUrl,
+      title: payload.title,
+      problemId: payload.problemId,
+      description: payload.description,
+      samples: payload.samples,
+      capturedAt: payload.capturedAt,
+      storageSchemaVersion: 3,
+      storageLayout: 'workspace-sidecar',
       code: payload.code,
       language: payload.language,
-      solutionPath: solution,
-      solutionRelativePath: path.relative(root, solution),
-      workspaceRootPath: root,
-      workspaceFolderUri: workspaceFolderForPath(solution)?.uri || '',
       solutionFileName: path.basename(solution),
       runtimeSolutionFileName: `solution.${extension}`,
       mainFileName: `main.${extension}`,
@@ -849,41 +760,22 @@ async function saveCapture(payload) {
         at: new Date().toISOString()
       }
     };
-    const archivedRecords = [];
-    try {
-      for (const record of collisionRecords) {
-        const destination = await archiveOverwrittenProblemRecord(record.folder);
-        if (!destination) throw new Error('同名题目的原记录在覆盖前发生了变化，请重新抓取。');
-        archivedRecords.push({ ...record, destination });
-      }
-    } catch (error) {
-      for (const archived of archivedRecords.reverse()) {
-        await fs.rename(archived.destination, archived.folder).catch((restoreError) => {
-          outputChannel?.appendLine(`Could not restore partially archived record ${archived.folder}: ${restoreError.message}`);
-        });
-        cacheSolutionRecord(archived.solutionPath, archived.folder);
-      }
-      throw error;
-    }
     const removeKnownArtifact = async (filePath) => {
       if (!filePath || pathKey(filePath) === pathKey(solution)) return;
+      if (!await assertSafeProblemArtifact(folder, filePath)) return;
       await fs.unlink(filePath).catch((error) => { if (error?.code !== 'ENOENT') throw error; });
     };
     const commitOperations = [
       writeFileAtomically(solution, payload.code),
       writeTextAtomically(metadata, JSON.stringify(metadataDocument, null, 2)),
       saveTestCases(folder, testCases, {
-        excludedAiIds: previousState.excludedAiIds,
-        excludedLeetCodeIds: previousState.excludedLeetCodeIds
+        excludedAiIds: [],
+        excludedLeetCodeIds: []
       })
     ];
-    if (isRegisteredCollision && mainSnapshot.exists) commitOperations.push(removeKnownArtifact(main));
+    if (mainSnapshot.exists) commitOperations.push(fs.unlink(main));
     if (obsoleteCurrentSolution) commitOperations.push(removeKnownArtifact(obsoleteCurrentSolution));
     if (obsoleteCurrentMain) commitOperations.push(removeKnownArtifact(obsoleteCurrentMain));
-    for (const record of collisionRecords) {
-      commitOperations.push(removeKnownArtifact(record.solutionPath));
-      commitOperations.push(removeKnownArtifact(path.join(path.dirname(record.solutionPath), `main${path.extname(record.solutionPath)}`)));
-    }
     const writes = await Promise.allSettled(commitOperations);
     const failedWrite = writes.find((result) => result.status === 'rejected');
     if (failedWrite) {
@@ -896,19 +788,9 @@ async function saveCapture(payload) {
       }
       await restore('metadata', () => restoreFileSnapshot(metadata, metadataSnapshot));
       await restore('testcases', () => restoreFileSnapshot(testCasesPath, testCasesSnapshot));
-      for (const archived of archivedRecords) {
-        await restore('overwritten record', async () => {
-          await fs.rename(archived.destination, archived.folder);
-          const ownerMetadata = JSON.parse(await fs.readFile(path.join(archived.folder, 'metadata.json'), 'utf8'));
-          const ownerRevision = String(ownerMetadata?.captureRevision || '');
-          if (ownerRevision) supersededCaptureJobs.delete(captureJobKey(archived.folder, ownerRevision));
-        });
-      }
       clearCachedProblemFolder(folder);
-      for (const archived of archivedRecords) clearCachedProblemFolder(archived.folder);
-      const restoredIncomingSolution = metadataSolutionPath(previousMetadata);
+      const restoredIncomingSolution = registeredState ? metadataSolutionPath(storedMetadata, folder) : '';
       if (restoredIncomingSolution && metadataSnapshot.exists) cacheSolutionRecord(restoredIncomingSolution, folder);
-      for (const archived of archivedRecords) cacheSolutionRecord(archived.solutionPath, archived.folder);
       const cause = failedWrite.reason?.message || '未知写入错误';
       if (rollbackErrors.length) {
         throw new Error(`保存同名题目失败，自动回滚不完整：${cause}；${rollbackErrors.join('；')}`);
@@ -921,9 +803,10 @@ async function saveCapture(payload) {
     // Older provider requests may still be in flight, but they must no longer
     // keep controls disabled or publish results when they eventually return.
     supersedeOlderCaptureJobs(folder, captureRevision);
-    const overwrittenRecordBackup = archivedRecords[0]?.destination || '';
-    const overwrittenSolutionBackup = overwrittenRecordBackup
-      ? path.join(overwrittenRecordBackup, `solution.${path.extname(archivedRecords[0].solutionPath).slice(1) || extension}.overwritten.bak`)
+    if (ai.configured) activeCaptureJobs.add(captureJobKey(folder, captureRevision));
+    const overwrittenRecordBackup = replacesRegisteredProblem ? backupFolder : '';
+    const overwrittenSolutionBackup = replacesRegisteredProblem && backupFolder
+      ? path.join(backupFolder, path.basename(previousRegisteredSolution || solution))
       : '';
     return {
       folder: path.relative(root, base), file: path.relative(root, solution),
@@ -931,21 +814,30 @@ async function saveCapture(payload) {
       overwrittenRecordBackup, overwrittenSolutionBackup,
       scaffoldStale, extraction, aiPending: ai.configured, captureRevision
     };
-    });
   });
   outputChannel?.appendLine(`Saved browser snapshot ${payload.title} → ${saved.solution}`);
-  if (settings.open) await vscode.window.showTextDocument(vscode.Uri.file(saved.solution), { preview: false });
+  if (settings.open) {
+    try {
+      await vscode.window.showTextDocument(vscode.Uri.file(saved.solution), { preview: false });
+    } catch (error) {
+      // Opening the editor is a convenience. The capture and its registered
+      // background job remain valid even if the workbench is still restoring.
+      outputChannel?.appendLine(`Could not open captured solution: ${error?.message || error}`);
+    }
+  }
   return saved;
 }
 
 async function processCapturedAi(payload, saved) {
   if (!saved?.aiPending) return { extraction: saved?.extraction, skipped: true };
-  const extraction = await extractCapturedTestCases(payload);
   const folder = saved.problemFolder;
-  if (!folder) throw new Error('后台 AI 处理缺少题目私有存储位置。');
+  if (!folder) throw new Error('后台 AI 处理缺少 .leetcode_cph 题目记录位置。');
   const jobKey = captureJobKey(folder, saved.captureRevision);
-  if (supersededCaptureJobs.has(jobKey)) return { extraction, superseded: true };
-  return withProblemLock(folder, async () => {
+  try {
+    const extraction = await extractCapturedTestCases(payload);
+    if (supersededCaptureJobs.has(jobKey)) return { extraction, superseded: true };
+    return await withProblemLock(folder, async () => {
+    await assertSafeProblemStateFolder(folder);
     const metadataPath = path.join(folder, 'metadata.json');
     let currentMetadata;
     try {
@@ -957,8 +849,8 @@ async function processCapturedAi(payload, saved) {
     if (currentMetadata.captureRevision !== saved.captureRevision) {
       return { extraction, superseded: true };
     }
-    const currentSolution = metadataSolutionPath(currentMetadata);
-    if (!currentSolution || !await fileExists(currentSolution)) {
+    const currentSolution = metadataSolutionPath(currentMetadata, folder);
+    if (!currentSolution || !await assertSafeProblemArtifact(folder, currentSolution)) {
       throw new Error('后台 AI 处理时找不到当前题目解答文件；如果刚刚移动了文件，请重新抓取题目。');
     }
     const currentSolutionDocument = openTextDocument(currentSolution);
@@ -971,6 +863,17 @@ async function processCapturedAi(payload, saved) {
     const testCases = mergeAiExtractedTestCases(previousState.testCases, payload, extraction.testCases, {
       excludedAiIds: previousState.excludedAiIds
     });
+    const persistedAiCount = testCases.filter((testCase) => testCase.source === AI_SOURCE).length;
+    let persistedExtraction = extraction;
+    if (Array.isArray(extraction.testCases)) {
+      const returnedCount = extraction.testCases.length;
+      const message = extraction.status === 'extracted'
+        ? returnedCount === persistedAiCount
+          ? `AI 已从题面提取 ${persistedAiCount} 个测试用例。`
+          : `AI 从题面识别 ${returnedCount} 个测试用例，实际保存 ${persistedAiCount} 个。`
+        : extraction.message;
+      persistedExtraction = { ...extraction, count: persistedAiCount, message };
+    }
     const testCasesChanged = JSON.stringify(previousState.testCases) !== JSON.stringify(testCases);
     const scaffold = path.join(path.dirname(currentSolution), `main${path.extname(currentSolution)}`);
     const hasScaffold = await fileExists(scaffold);
@@ -979,11 +882,11 @@ async function processCapturedAi(payload, saved) {
       ...currentMetadata,
       testcaseScaffoldStale: scaffoldStale,
       testcaseExtraction: {
-        status: extraction.status,
-        provider: extraction.provider,
-        model: extraction.model,
-        count: Array.isArray(extraction.testCases) ? extraction.testCases.length : undefined,
-        message: extraction.message,
+        status: persistedExtraction.status,
+        provider: persistedExtraction.provider,
+        model: persistedExtraction.model,
+        count: Array.isArray(extraction.testCases) ? persistedAiCount : undefined,
+        message: persistedExtraction.message,
         at: new Date().toISOString()
       }
     };
@@ -1035,8 +938,15 @@ async function processCapturedAi(payload, saved) {
         });
       }
     }
-    return { extraction, testCases, scaffoldGenerated, scaffoldStale, scaffoldError };
-  });
+      if (supersededCaptureJobs.has(jobKey)) {
+        return { extraction: persistedExtraction, testCases, scaffoldGenerated, scaffoldStale, scaffoldError, superseded: true };
+      }
+      return { extraction: persistedExtraction, testCases, scaffoldGenerated, scaffoldStale, scaffoldError };
+    });
+  } finally {
+    activeCaptureJobs.delete(jobKey);
+    supersededCaptureJobs.delete(jobKey);
+  }
 }
 
 async function markCaptureProcessingFailed(saved, error) {
@@ -1044,6 +954,7 @@ async function markCaptureProcessingFailed(saved, error) {
   if (!folder) return;
   const message = String(error?.message || 'AI 后台处理失败。').slice(0, 800);
   await withProblemLock(folder, async () => {
+    await assertSafeProblemStateFolder(folder);
     const metadataPath = path.join(folder, 'metadata.json');
     let metadata;
     try {
@@ -1065,6 +976,43 @@ async function markCaptureProcessingFailed(saved, error) {
   });
 }
 
+function interruptedCaptureMetadata(metadata, message = '上次 AI 处理因 VS Code 重载或题目目录移动而中断；请重新抓取题目后重试。') {
+  return {
+    ...metadata,
+    testcaseScaffoldStale: true,
+    testcaseScaffoldError: message,
+    testcaseExtraction: {
+      ...(metadata?.testcaseExtraction || {}),
+      status: 'failed',
+      message,
+      at: new Date().toISOString()
+    }
+  };
+}
+
+async function repairOrphanedPendingExtraction(folder, metadata, { lockHeld = false } = {}) {
+  if (metadata?.testcaseExtraction?.status !== 'pending') return metadata;
+  const jobKey = captureJobKey(folder, metadata?.captureRevision);
+  if (activeCaptureJobs.has(jobKey)) return metadata;
+  const expectedRevision = String(metadata?.captureRevision || '');
+  const persistCurrent = async () => {
+    await assertSafeProblemStateFolder(folder);
+    const metadataPath = path.join(folder, 'metadata.json');
+    const current = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    if (String(current?.captureRevision || '') !== expectedRevision) {
+      throw new Error('题目记录刚刚已被新的浏览器抓取替换，请重试当前操作。');
+    }
+    if (current?.testcaseExtraction?.status !== 'pending'
+      || activeCaptureJobs.has(captureJobKey(folder, current.captureRevision))) return current;
+    const next = interruptedCaptureMetadata(current);
+    await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2));
+    return next;
+  };
+  // Mutation/run paths already own the per-problem lock. Other readers acquire
+  // it here so an older sidebar refresh cannot overwrite a newer recapture.
+  return lockHeld ? persistCurrent() : withProblemLock(folder, persistCurrent);
+}
+
 async function repairInterruptedCaptureJobs() {
   const records = await listStoredProblemRecords();
   for (const record of records) {
@@ -1080,18 +1028,8 @@ async function repairInterruptedCaptureJobs() {
       }
       if (metadata?.testcaseExtraction?.status !== 'pending'
         || String(metadata?.captureRevision || '') !== scannedRevision) return;
-      const message = '上次 AI 处理因 VS Code 重载而中断；请从浏览器重新抓取题目后重试。';
-      const next = {
-        ...metadata,
-        testcaseScaffoldStale: true,
-        testcaseScaffoldError: message,
-        testcaseExtraction: {
-          ...(metadata.testcaseExtraction || {}),
-          status: 'failed',
-          message,
-          at: new Date().toISOString()
-        }
-      };
+      if (activeCaptureJobs.has(captureJobKey(record.folder, metadata.captureRevision))) return;
+      const next = interruptedCaptureMetadata(metadata);
       await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2));
     });
   }
@@ -1312,7 +1250,23 @@ async function writeFileAtomically(filePath, content) {
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
     await fs.writeFile(temporary, content, 'utf8');
-    await fs.rename(temporary, filePath);
+    let lastError;
+    const delays = [10, 25, 50, 100];
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+      try {
+        await fs.rename(temporary, filePath);
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt === delays.length) throw error;
+        // Windows indexers and antivirus scanners can hold a just-written JSON
+        // file for a few milliseconds. Preserve atomic replacement semantics
+        // while tolerating that short-lived lock.
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
+    if (lastError) throw lastError;
   } finally {
     await fs.unlink(temporary).catch(() => {});
   }
@@ -1401,17 +1355,6 @@ async function readOpenDocumentOrFile(filePath) {
   return document ? document.getText() : fs.readFile(filePath, 'utf8');
 }
 
-async function findSolutionFile(problemFolder, preferredExtension) {
-  const preferred = path.join(problemFolder, `solution${preferredExtension}`);
-  if (await fileExists(preferred)) return preferred;
-  const entries = await fs.readdir(problemFolder, { withFileTypes: true });
-  const candidates = entries
-    .filter((entry) => entry.isFile() && /^solution\.[^.]+$/i.test(entry.name))
-    .map((entry) => path.join(problemFolder, entry.name));
-  if (candidates.length === 1) return candidates[0];
-  throw new Error('未找到同目录的 solution.* 文件，无法读取被测代码。');
-}
-
 async function activeProblemIdentity({ required = true } = {}) {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.uri.scheme !== 'file') {
@@ -1425,7 +1368,7 @@ async function activeProblemIdentity({ required = true } = {}) {
     let solutionPath = activeFilePath;
     if (/^main\.[^.]+$/i.test(activeName)) {
       const metadata = JSON.parse(await fs.readFile(path.join(storedFolder, 'metadata.json'), 'utf8'));
-      solutionPath = metadataSolutionPath(metadata);
+      solutionPath = metadataSolutionPath(metadata, storedFolder);
       if (!solutionPath || !await fileExists(solutionPath)) {
         throw new Error('找不到 main 对应的 solution 文件，请重新抓取题目。');
       }
@@ -1445,17 +1388,38 @@ async function activeProblemIdentity({ required = true } = {}) {
   }
 
   // A workspace may already contain a conventional solution.* file without a
-  // private LeetCode record (for example after storage was cleared). Keep a
-  // small private manual-case store for it, but do not infer problem metadata,
+  // valid sibling .leetcode_cph record. Keep a local manual-case sidecar for
+  // it, but do not infer problem metadata,
   // call AI, sync, or enable execution until a browser capture registers it.
   const unmanagedSolution = /^solution\.[^.]+$/i.test(activeName)
     ? activeFilePath
     : /^main\.[^.]+$/i.test(activeName)
       ? path.join(path.dirname(activeFilePath), `solution${path.extname(activeFilePath)}`)
       : '';
-  if (extensionStoragePath && unmanagedSolution && workspaceFolderForPath(unmanagedSolution)
+  if (unmanagedSolution && workspaceFolderForPath(unmanagedSolution)
     && await fileExists(unmanagedSolution)) {
+    const unmanagedExtension = path.extname(unmanagedSolution).slice(1).toLowerCase();
+    if (!Object.values(EXTENSIONS).includes(unmanagedExtension)) {
+      throw new Error(`不支持将 solution.${unmanagedExtension || '<无后缀>'} 建立为本地题目记录。请使用插件支持的语言后缀。`);
+    }
     const localFolder = localStateFolderForSolution(unmanagedSolution);
+    await assertSafeProblemArtifact(localFolder, unmanagedSolution, { allowMissing: false });
+    const stateExists = await assertSafeProblemStateFolder(localFolder);
+    if (stateExists) {
+      let localMetadata;
+      try {
+        localMetadata = JSON.parse(await fs.readFile(path.join(localFolder, 'metadata.json'), 'utf8'));
+      } catch (_) {
+        throw new Error('当前题目文件夹已有无效的 .leetcode_cph，已拒绝把它覆盖为本地记录。请移走该目录或从浏览器重新抓取题目。');
+      }
+      const recordedLocalSolution = metadataSolutionPath(localMetadata, localFolder);
+      if (Number(localMetadata?.storageSchemaVersion) !== 3
+        || localMetadata?.storageLayout !== 'workspace-sidecar'
+        || localMetadata?.localOnly !== true
+        || pathKey(recordedLocalSolution) !== pathKey(unmanagedSolution)) {
+        throw new Error('当前 .leetcode_cph 属于另一份解答或不是有效的本地记录，已拒绝修改其测试用例。');
+      }
+    }
     return {
       folder: localFolder,
       stateFolder: localFolder,
@@ -1468,59 +1432,28 @@ async function activeProblemIdentity({ required = true } = {}) {
     };
   }
 
-  // The hidden scaffold may be opened explicitly from a warning or diagnostic.
-  // Resolve it back to the registered visible solution without exposing any
-  // other private record as an active problem.
-  if (/^testcase\.[^.]+$/i.test(activeName) && extensionStoragePath && isPathInside(extensionStoragePath, activeFilePath)) {
-    try {
-      const stateFolder = path.dirname(activeFilePath);
-      const metadata = JSON.parse(await fs.readFile(path.join(stateFolder, 'metadata.json'), 'utf8'));
-      const solutionPath = metadataSolutionPath(metadata);
-      if (solutionPath && await fileExists(solutionPath)) {
-        cacheSolutionRecord(solutionPath, stateFolder);
-        return {
-          folder: stateFolder,
-          stateFolder,
-          workspaceProblemFolder: path.dirname(solutionPath),
-          solutionPath,
-          solutionFileName: path.basename(solutionPath),
-          activeFilePath,
-          code: await readOpenDocumentOrFile(solutionPath)
-        };
-      }
-    } catch (_) { /* Fall through to legacy layout detection. */ }
-  }
-
-  // Backward-compatible read support for old workspace-visible
-  // `<problem>/solution.* + metadata.json + testcase.*` directories. Legacy
-  // testcase.* is imported only as a non-executable backup.
-  const isSolution = /^solution\.[^.]+$/i.test(activeName);
-  const isScaffold = /^(?:testcase|main)\.[^.]+$/i.test(activeName);
-  if (!isSolution && !isScaffold) {
-    if (!required) return null;
-    throw new Error('当前文件不是由 LeetCode CPH 登记的题目解答。请从浏览器重新抓取一次该题目。');
-  }
-  const folder = path.dirname(activeFilePath);
-  const solutionPath = isSolution
-    ? activeFilePath
-    : await findSolutionFile(folder, path.extname(activeFilePath));
-  const code = isSolution ? editor.document.getText() : await readOpenDocumentOrFile(solutionPath);
-  return {
-    folder,
-    stateFolder: folder,
-    workspaceProblemFolder: path.dirname(solutionPath),
-    solutionPath,
-    solutionFileName: path.basename(solutionPath),
-    activeFilePath,
-    code
-  };
+  if (!required) return null;
+  throw new Error('当前文件没有有效的 .leetcode_cph 题目记录。请打开 solution/main，或从浏览器重新抓取题目。');
 }
 
-async function problemContextFromIdentity(identity) {
+async function problemContextFromIdentity(identity, { lockHeld = false } = {}) {
   if (identity.localOnly) {
+    const stateExists = await assertSafeProblemStateFolder(identity.folder);
     let metadata = {};
-    try { metadata = JSON.parse(await fs.readFile(path.join(identity.folder, 'metadata.json'), 'utf8')); } catch (_) { /* Fresh local-only record. */ }
-    const testCases = await loadTestCases(identity.folder);
+    if (stateExists) {
+      try {
+        metadata = JSON.parse(await fs.readFile(path.join(identity.folder, 'metadata.json'), 'utf8'));
+      } catch (_) {
+        throw new Error('无法读取当前本地解答的 .leetcode_cph 记录。');
+      }
+      if (Number(metadata?.storageSchemaVersion) !== 3
+        || metadata?.storageLayout !== 'workspace-sidecar'
+        || metadata?.localOnly !== true
+        || pathKey(metadataSolutionPath(metadata, identity.folder)) !== pathKey(identity.solutionPath)) {
+        throw new Error('当前 .leetcode_cph 不属于这份本地解答，已拒绝修改其测试用例。');
+      }
+    }
+    const testCases = stateExists ? await loadTestCases(identity.folder) : [];
     return {
       ...identity,
       metadata: {
@@ -1536,13 +1469,18 @@ async function problemContextFromIdentity(identity) {
       testCases
     };
   }
+  await assertSafeProblemStateFolder(identity.folder);
   let metadata;
   try {
     metadata = JSON.parse(await fs.readFile(path.join(identity.folder, 'metadata.json'), 'utf8'));
   } catch (_) {
-    throw new Error('无法读取该解答对应的私有题目记录，请从浏览器重新抓取。');
+    throw new Error('无法读取该解答对应的 .leetcode_cph 题目记录，请从浏览器重新抓取。');
   }
-  if (!metadata?.source) throw new Error('私有题目记录中缺少来源链接，请重新抓取。');
+  if (Number(metadata?.storageSchemaVersion) !== 3 || metadata?.storageLayout !== 'workspace-sidecar'
+    || !isLeetCodeProblemUrl(metadata?.source)) {
+    throw new Error('.leetcode_cph 题目记录无效，请从浏览器重新抓取。');
+  }
+  metadata = await repairOrphanedPendingExtraction(identity.folder, metadata, { lockHeld });
   const testCases = await loadOrMigrateTestCases(identity.folder, metadata);
   return {
     ...identity,
@@ -1584,26 +1522,27 @@ async function prepareRuntimeSolution(context) {
 }
 
 async function ensurePersistedTestCases(context) {
-  await fs.mkdir(context.folder, { recursive: true });
+  await assertSafeProblemStateFolder(context.folder, { create: true });
   const storageFile = path.join(context.folder, TEST_CASES_FILE);
-  const testCases = await fileExists(storageFile)
-    ? context.testCases
-    : await saveTestCases(context.folder, context.testCases);
-  if (context.localOnly && !await fileExists(path.join(context.folder, 'metadata.json'))) {
-    const workspace = workspaceFolderForPath(context.solutionPath);
+  const metadataPath = path.join(context.folder, 'metadata.json');
+  if (context.localOnly && !await fileExists(metadataPath)) {
     const localMetadata = {
-      storageSchemaVersion: 2,
+      storageSchemaVersion: 3,
+      storageLayout: 'workspace-sidecar',
       localOnly: true,
       title: context.title,
       language: context.language,
-      solutionPath: context.solutionPath,
-      solutionRelativePath: workspace ? path.relative(workspace.path, context.solutionPath) : '',
-      workspaceRootPath: workspace?.path || '',
-      workspaceFolderUri: workspace?.uri || '',
+      solutionFileName: path.basename(context.solutionPath),
       savedAt: new Date().toISOString()
     };
-    await writeTextAtomically(path.join(context.folder, 'metadata.json'), JSON.stringify(localMetadata, null, 2));
+    // Establish ownership first. If the following testcase write is
+    // interrupted, a valid local-only record with an empty case list remains
+    // recoverable instead of an ownerless sidecar that must be deleted.
+    await writeTextAtomically(metadataPath, JSON.stringify(localMetadata, null, 2));
   }
+  const testCases = await fileExists(storageFile)
+    ? context.testCases
+    : await saveTestCases(context.folder, context.testCases);
   return { ...context, testCases };
 }
 
@@ -1624,7 +1563,7 @@ async function configuredAiState() {
 }
 
 async function extractTestCasesForContext(context) {
-  if (context?.localOnly) throw new Error('该 solution 没有私有题目信息，不能使用 AI 提取测试用例。');
+  if (context?.localOnly) throw new Error('该 solution 没有有效的 .leetcode_cph 题目记录，不能使用 AI 提取测试用例。');
   if (!aiTestcaseService) throw new Error('AI 服务尚未初始化，请重新加载 VS Code 扩展。');
   const ai = await configuredAiState();
   if (!ai.configured) {
@@ -1666,7 +1605,7 @@ async function extractTestCasesForContext(context) {
 }
 
 async function generateTestScaffold(context, testCases, operation) {
-  if (context?.localOnly) throw new Error('该 solution 没有私有题目信息，不能生成 main 测试代码。');
+  if (context?.localOnly) throw new Error('该 solution 没有有效的 .leetcode_cph 题目记录，不能生成 main 测试代码。');
   if (reservedSolutionFileName(context?.solutionPath)) {
     throw new Error('题目解答不能命名为 main.<语言> 或 testcase.<语言>，已拒绝覆盖。请将文件改回 solution.<语言>。');
   }
@@ -1678,6 +1617,8 @@ async function generateTestScaffold(context, testCases, operation) {
     throw new Error('当前没有测试用例，无法生成测试脚手架。');
   }
   requireTrustedWorkspace('生成');
+  await assertSafeProblemStateFolder(context.folder);
+  await assertSafeProblemArtifact(context.folder, context.solutionPath, { allowMissing: false });
   const ai = await configuredAiState();
   if (!ai.configured) {
     const label = providerInfo(ai.provider).label;
@@ -1689,6 +1630,7 @@ async function generateTestScaffold(context, testCases, operation) {
     throw new Error(`请先保存 ${path.basename(destination)} 中的手动编辑，再更新测试脚手架。`);
   }
   const destinationExists = await fileExists(destination);
+  if (destinationExists) await assertSafeProblemArtifact(context.folder, destination, { allowMissing: false });
   const existingScaffold = openScaffold ? openScaffold.getText() : await readTextIfPresent(destination);
   if (operation?.type === 'repair') {
     const currentSolutionCode = await readOpenDocumentOrFile(context.solutionPath);
@@ -1717,6 +1659,10 @@ async function generateTestScaffold(context, testCases, operation) {
     provider: ai.provider,
     model: ai.model
   });
+  // The provider call may take long enough for workspace paths to change.
+  // Revalidate every filesystem boundary before writing its result.
+  await assertSafeProblemStateFolder(context.folder);
+  await assertSafeProblemArtifact(context.folder, context.solutionPath, { allowMissing: false });
   const currentSolutionCode = await readOpenDocumentOrFile(context.solutionPath);
   if (currentSolutionCode !== context.code) {
     throw new Error('AI 生成测试代码期间题目解答发生了变化，未写入旧脚手架。请保存代码后重试。');
@@ -1726,6 +1672,9 @@ async function generateTestScaffold(context, testCases, operation) {
     throw new Error(`AI 生成期间 ${path.basename(destination)} 出现未保存修改，未覆盖该文件。请先保存或还原修改后重试。`);
   }
   const currentDestinationExists = await fileExists(destination);
+  if (currentDestinationExists) {
+    await assertSafeProblemArtifact(context.folder, destination, { allowMissing: false });
+  }
   const currentScaffold = currentDestinationExists ? await readTextIfPresent(destination) : '';
   if (currentDestinationExists !== destinationExists || currentScaffold !== existingScaffold) {
     throw new Error(`AI 生成期间 ${path.basename(destination)} 已发生变化，未覆盖较新的本地内容。请重试。`);
@@ -1736,7 +1685,7 @@ async function generateTestScaffold(context, testCases, operation) {
   // the atomic replacement; if this write fails, leave the live scaffold
   // untouched instead of risking the user's local framework.
   const backup = destinationExists
-    ? path.join(context.folder, `main${path.extname(destination)}.bak`)
+    ? path.join(await createProblemBackupFolder(context.folder), path.basename(destination))
     : '';
   if (backup) await writeTextAtomically(backup, existingScaffold);
   await writeTextAtomically(destination, generated.content);
@@ -1993,6 +1942,19 @@ async function refreshSidebar(extra = {}) {
   return state;
 }
 
+async function openSidebarAfterCapture() {
+  if (typeof vscode.commands?.executeCommand !== 'function') return;
+  try {
+    await vscode.commands.executeCommand('workbench.view.extension.leetcodeCph');
+    await vscode.commands.executeCommand(`${LeetCodeCphSidebarProvider.viewType}.focus`);
+  } catch (error) {
+    // Opening the view is a convenience after a successful capture. Never
+    // turn a saved problem into a failed browser request because the workbench
+    // is still restoring or a third-party layout temporarily rejects focus.
+    outputChannel?.appendLine(`Could not open the LeetCode CPH sidebar after capture: ${error?.message || error}`);
+  }
+}
+
 async function configureAi() {
   if (!aiTestcaseService) throw new Error('VS Code SecretStorage 不可用，无法安全保存 API Key。');
   const configured = await aiTestcaseService.getConfiguredProviders();
@@ -2082,7 +2044,7 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
   let aiJobStarted = false;
   try {
     return await withProblemLock(identity.folder, async () => {
-      let context = await problemContextFromIdentity(identity);
+      let context = await problemContextFromIdentity(identity, { lockHeld: true });
       const localOnly = Boolean(context.localOnly);
       assertSidebarProblem(context, payload?.problemKey);
       assertProblemAiIdle(context);
@@ -2201,7 +2163,7 @@ async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
 async function regenerateTestScaffold(payload = {}) {
   const identity = await activeProblemIdentity();
   if (identity.localOnly) {
-    throw new Error('该 solution 没有私有题目信息，不能生成 main 测试代码。');
+    throw new Error('该 solution 没有有效的 .leetcode_cph 题目记录，不能生成 main 测试代码。');
   }
   const identityKey = pathKey(identity.folder);
   if (captureJobActiveForFolder(identity.folder) || activeTestcaseAiJobs.has(identityKey)) {
@@ -2211,7 +2173,7 @@ async function regenerateTestScaffold(payload = {}) {
   void refreshSidebar();
   try {
     return await withProblemLock(identity.folder, async () => {
-      let context = await problemContextFromIdentity(identity);
+      let context = await problemContextFromIdentity(identity, { lockHeld: true });
       assertSidebarProblem(context, payload?.problemKey);
       if (context.metadata?.testcaseExtraction?.status === 'pending') {
         throw new Error('AI 测试用例提取尚未完成，请等待后重试。');
@@ -2287,11 +2249,11 @@ function sidebarResultsFromRun(testCases, rawResults, selectedName) {
 async function runTestsFromSidebar(mode, payload) {
   const identity = await activeProblemIdentity();
   return withProblemLock(identity.folder, async () => {
-    const context = await problemContextFromIdentity(identity);
+    const context = await problemContextFromIdentity(identity, { lockHeld: true });
     assertSidebarProblem(context, payload?.problemKey);
     assertProblemAiIdle(context);
     if (context.localOnly) {
-      throw new Error('该 solution 没有私有题目信息，不能运行测试。请从浏览器重新抓取题目后再试。');
+      throw new Error('该 solution 没有有效的 .leetcode_cph 题目记录，不能运行测试。请从浏览器重新抓取题目后再试。');
     }
     requireTrustedWorkspace('运行');
     if (context.metadata?.testcaseScaffoldStale) {
@@ -2546,8 +2508,6 @@ function startServer() {
         const payload = JSON.parse(raw);
         if (!validPayload(payload)) throw new Error('接收到的数据不完整。');
         const saved = await saveCapture(payload);
-        const jobKey = saved.aiPending ? captureJobKey(saved.problemFolder, saved.captureRevision) : '';
-        if (jobKey) activeCaptureJobs.add(jobKey);
         respond(response, 200, {
           ok: true,
           folder: saved.folder,
@@ -2561,6 +2521,7 @@ function startServer() {
         clearRunResults();
         setSidebarRuntime({ notice, error: '' });
         void refreshSidebar();
+        void openSidebarAfterCapture();
         if (saved.aiPending) {
           void processCapturedAi(payload, saved).then((result) => {
             if (result?.superseded) return;
@@ -2580,13 +2541,7 @@ function startServer() {
             });
             setSidebarRuntime({ notice: '', error: `题面和网页代码已保存，但 ${message}` });
             void refreshSidebar();
-          }).finally(() => {
-            if (jobKey) {
-              activeCaptureJobs.delete(jobKey);
-              supersededCaptureJobs.delete(jobKey);
-            }
-            void refreshSidebar();
-          });
+          }).finally(() => { void refreshSidebar(); });
         }
       } catch (error) {
         outputChannel.appendLine(`Capture failed: ${error.stack || error.message}`);
@@ -2604,69 +2559,73 @@ function startServer() {
 
 async function handleSolutionRenames(event) {
   if (!workspaceFolders().length) return;
-  const records = await listStoredProblemRecords();
-  const updatedFolders = new Set();
   for (const item of event?.files || []) {
     const oldPath = item.oldUri?.scheme === 'file' ? item.oldUri.fsPath : '';
     const newPath = item.newUri?.scheme === 'file' ? item.newUri.fsPath : '';
     if (!oldPath || !newPath) continue;
-    for (const record of records) {
-      if (updatedFolders.has(pathKey(record.folder))) continue;
-      const oldSolution = record.solutionPath;
-      if (!isPathInside(oldPath, oldSolution)) continue;
-      const relative = path.relative(path.resolve(oldPath), path.resolve(oldSolution));
-      const rebasedSolution = relative ? path.resolve(newPath, relative) : path.resolve(newPath);
-      if (reservedSolutionFileName(rebasedSolution)) {
-        vscode.window.showWarningMessage('main.<语言> 和 testcase.<语言> 是测试入口保留名称，不能作为题目解答文件名。请将文件改回 solution.<语言>。');
-        continue;
-      }
-      const targetWorkspace = workspaceFolderForPath(rebasedSolution);
-      if (!targetWorkspace || path.extname(oldSolution).toLowerCase() !== path.extname(rebasedSolution).toLowerCase()) {
-        vscode.window.showWarningMessage('题目解答移出当前工作区或更改语言后无法继续关联；请移回工作区、改回原后缀，或重新抓取题目。');
-        continue;
-      }
-      await withProblemLock(record.folder, async () => {
-        const metadataPath = path.join(record.folder, 'metadata.json');
-        const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
-        // The filesystem move happens before VS Code delivers this async
-        // callback. A newer capture may already have recreated the old path
-        // and advanced the record. In that case this event belongs to the
-        // previous revision and must not redirect the fresh capture to the
-        // renamed file containing older code.
-        if (record.metadata?.captureRevision
-          && metadata.captureRevision !== record.metadata.captureRevision) return;
-        const latestSolution = metadataSolutionPath(metadata);
-        if (!latestSolution || !isPathInside(oldPath, latestSolution)) return;
-        const latestRelative = path.relative(path.resolve(oldPath), path.resolve(latestSolution));
-        const latestRebased = latestRelative ? path.resolve(newPath, latestRelative) : path.resolve(newPath);
-        const latestWorkspace = workspaceFolderForPath(latestRebased);
-        if (!latestWorkspace || reservedSolutionFileName(latestRebased)
-          || path.extname(latestSolution).toLowerCase() !== path.extname(latestRebased).toLowerCase()) return;
-        if (pathKey(latestSolution) !== pathKey(latestRebased) && await fileExists(latestSolution)) return;
-        const solutionFileRenamed = path.basename(latestSolution) !== path.basename(latestRebased);
-        const next = {
-          ...metadata,
-          solutionPath: latestRebased,
-          solutionRelativePath: path.relative(latestWorkspace.path, latestRebased),
-          workspaceRootPath: latestWorkspace.path,
-          workspaceFolderUri: latestWorkspace.uri,
-          solutionFileName: path.basename(latestRebased),
-          testcaseScaffoldStale: solutionFileRenamed
-            ? true
-            : Boolean(metadata.testcaseScaffoldStale)
-        };
-        await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2));
-        solutionRecordCache.delete(pathKey(latestSolution));
-        cacheSolutionRecord(latestRebased, record.folder);
-      });
-      updatedFolders.add(pathKey(record.folder));
+
+    let newStat;
+    try { newStat = await fs.lstat(newPath); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
     }
+    if (newStat?.isDirectory()) {
+      // Moving the whole title directory also moves its sidecar. A provider
+      // request cannot be safely rebound to a new path mid-flight, so mark that
+      // revision interrupted and unlock the moved record immediately.
+      const movedDirectoryState = problemStateFolder(newPath);
+      let movedSolution = '';
+      await withProblemLock(movedDirectoryState, async () => {
+        if (!await assertSafeProblemStateFolder(movedDirectoryState)) return;
+        const metadataPath = path.join(movedDirectoryState, 'metadata.json');
+        let metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+        if (Number(metadata?.storageSchemaVersion) !== 3 || metadata?.storageLayout !== 'workspace-sidecar') {
+          throw new Error('移动后的 .leetcode_cph 不是有效的当前版本题目记录。');
+        }
+        movedSolution = metadataSolutionPath(metadata, movedDirectoryState);
+        if (!movedSolution || !await assertSafeProblemArtifact(movedDirectoryState, movedSolution, { allowMissing: false })) {
+          throw new Error('移动后的题目目录中找不到安全的 solution 文件。');
+        }
+        const destinationJobKey = captureJobKey(movedDirectoryState, metadata.captureRevision);
+        const oldJobKey = captureJobKey(problemStateFolder(oldPath), metadata.captureRevision);
+        const destinationJobActive = activeCaptureJobs.has(destinationJobKey);
+        const oldJobActive = activeCaptureJobs.has(oldJobKey);
+        // A delayed rename event must never fail a newer capture that already
+        // owns the destination record and is actively processing it. Otherwise
+        // moving at any phase of the old job (extraction or scaffold generation)
+        // interrupts that job and unlocks the moved record.
+        if (!destinationJobActive
+          && (oldJobActive || metadata?.testcaseExtraction?.status === 'pending')) {
+          if (oldJobActive) supersededCaptureJobs.add(oldJobKey);
+          metadata = interruptedCaptureMetadata(metadata);
+          await writeTextAtomically(metadataPath, JSON.stringify(metadata, null, 2));
+        }
+        clearCachedProblemFolder(problemStateFolder(oldPath));
+        cacheSolutionRecord(movedSolution, movedDirectoryState);
+      });
+      if (!movedSolution) continue;
+      continue;
+    }
+
+    // The on-disk contract intentionally keeps the answer named solution.<ext>.
+    // Do not rewrite trusted ownership metadata to follow an arbitrary sibling
+    // basename, because a workspace-controlled metadata file must never grant
+    // deletion/sync/AI ownership over README, .env, or other local files.
+    const stateFolder = problemStateFolder(path.dirname(oldPath));
+    if (!await assertSafeProblemStateFolder(stateFolder)) continue;
+    const metadata = JSON.parse(await fs.readFile(path.join(stateFolder, 'metadata.json'), 'utf8'));
+    const recordedSolution = metadataSolutionPath(metadata, stateFolder);
+    if (!recordedSolution || pathKey(recordedSolution) !== pathKey(oldPath)) continue;
+    // A delayed event from before a newer recapture must not disturb the new
+    // canonical file that now owns the record.
+    if (pathKey(oldPath) !== pathKey(newPath) && await fileExists(oldPath)) continue;
+    solutionRecordCache.delete(pathKey(oldPath));
+    vscode.window.showWarningMessage('题目解答必须保留名称 solution.<语言后缀>。当前文件已不再关联；请改回原名或重新抓取题目。');
   }
   void refreshSidebar();
 }
 
 function activate(context) {
-  initializeExtensionStorage(context);
+  initializeProblemStorage();
   outputChannel = vscode.window.createOutputChannel('LeetCode CPH Receiver');
   applyTracker = new ApplyTracker({ log: (line) => outputChannel.appendLine(line) });
   // API keys are deliberately held only by VS Code SecretStorage.  Unit-test
@@ -2695,8 +2654,7 @@ function activate(context) {
         clearRunResults(stateFolder);
         void refreshSidebar();
       } else if (/^(?:solution|main|testcase)\.[^.]+$/i.test(name)) {
-        // Legacy visible-directory compatibility.
-        clearRunResults(path.dirname(filePath));
+        clearRunResults(problemStateFolder(path.dirname(filePath)));
         void refreshSidebar();
       }
     }));
@@ -2746,7 +2704,6 @@ function deactivate() {
   activeCaptureJobs.clear();
   supersededCaptureJobs.clear();
   activeTestcaseAiJobs.clear();
-  extensionStoragePath = '';
   for (const client of socketClients) client.socket.destroy();
   return new Promise((resolve) => server?.close(resolve) || resolve());
 }
