@@ -17,3 +17,6 @@ yarn-debug.log*
 yarn-error.log*
 .env
 .env.*
+
+# Per-problem LeetCode CPH state
+**/.leetcode_cph/

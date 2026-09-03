@@ -12,6 +12,10 @@ LeetCode CPH connects a browser extension with a VS Code extension so you can ca
   <output directory>/<problem title>/
     solution.<ext>
     main.<ext>
+    .leetcode_cph/
+      metadata.json
+      testcases.json
+      backups/
   ```
 
   `solution.<ext>` is your answer. `main.<ext>` is the AI-generated local test entry point and is created only after AI generation succeeds.
@@ -24,7 +28,7 @@ LeetCode CPH connects a browser extension with a VS Code extension so you can ca
 - Sync the current `solution.<ext>` code to the matching open LeetCode page with the sidebar button. The former Command Palette sync command is no longer used.
 - Open the project's GitHub issue page from the sidebar.
 
-Problem metadata, editable test-case data, and overwrite backups are kept in VS Code's private workspace storage. They are not added to your project folder.
+Problem metadata, editable test-case data, and overwrite backups are kept in the problem's `.leetcode_cph` folder. API keys remain in VS Code Secret Storage and are never written there. Add `**/.leetcode_cph/` to your repository's ignore rules if you do not want local test state committed.
 
 ## Installation
 
@@ -46,13 +50,13 @@ If you already have a `.vsix` package:
 
 1. Open the **Extensions** view in VS Code.
 2. Select `...` and then **Install from VSIX...**.
-3. Choose `leetcode-cph-receiver-0.7.1.vsix` (or the newer package you built).
+3. Choose `leetcode-cph-receiver-0.8.0.vsix` (or the newer package you built).
 4. Reload VS Code after installation.
 
 You can also install it from a terminal:
 
 ```powershell
-code --install-extension .\vscode-extension\leetcode-cph-receiver-0.7.1.vsix
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.8.0.vsix
 ```
 
 To build the VSIX from source, run:
@@ -75,7 +79,9 @@ The generated `.vsix` file is placed in the `vscode-extension` folder.
 
 If an AI key is configured, example extraction and `main.<ext>` generation continue in the background. While either job is running, test cases cannot be added, edited, or deleted.
 
-Capturing the same registered problem title again replaces its recorded solution and test entry files. Previous registered files are backed up in private extension storage before replacement. Unsaved editors are not overwritten; save or close them and capture again.
+Capturing a problem again replaces its recorded test state and starts a fresh AI extraction; old automatic and manual cases and deletion history are not reused. A different problem with the same title also replaces the prior registered files and state. Previous registered files are backed up under `.leetcode_cph/backups`. Unsaved editors are not overwritten; save or close them and capture again.
+
+This storage layout is intentionally incompatible with older releases. Existing records in VS Code's former private extension storage or in legacy problem-folder files are not imported; capture the problem again to create `.leetcode_cph`.
 
 ### 2. Configure AI and manage test cases
 
@@ -117,7 +123,7 @@ The required compiler or runtime must be installed locally and available through
 
 ## Unlinked local solutions
 
-If a workspace already contains `solution.<ext>` but the extension cannot find its private problem record and source URL, the file is treated as an unlinked local solution. You may manually add, edit, and delete test cases, but AI extraction, `main.<ext>` generation, local execution, and browser sync are disabled because the problem cannot be matched safely.
+If a workspace already contains `solution.<ext>` but the extension cannot find a valid sibling `.leetcode_cph` record and source URL, the file is treated as an unlinked local solution. You may manually add, edit, and delete test cases, but AI extraction, `main.<ext>` generation, local execution, and browser sync are disabled because the problem cannot be matched safely.
 
 ## Feedback
 

@@ -1,7 +1,7 @@
 {
   "name": "leetcode-cph",
   "private": true,
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Capture LeetCode problems, manage AI-assisted local test cases, run them, and sync solutions from VS Code.",
   "scripts": {
     "test": "node --test test/"

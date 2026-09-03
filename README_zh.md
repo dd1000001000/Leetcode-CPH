@@ -12,6 +12,10 @@ LeetCode CPH 通过浏览器扩展与 VS Code 插件配合，让你抓取 LeetCo
   <输出目录>/<题目名称>/
     solution.<语言后缀>
     main.<语言后缀>
+    .leetcode_cph/
+      metadata.json
+      testcases.json
+      backups/
   ```
 
   `solution.<语言后缀>` 是你的解答；`main.<语言后缀>` 是 AI 生成的本地测试入口，只有 AI 生成成功后才会创建。
@@ -24,7 +28,7 @@ LeetCode CPH 通过浏览器扩展与 VS Code 插件配合，让你抓取 LeetCo
 - 在侧边栏点击按钮，把当前 `solution.<语言后缀>` 同步到匹配的 LeetCode 题目页。旧的命令面板同步方式已移除。
 - 从侧边栏直接打开项目的 GitHub Bug 反馈页面。
 
-题目信息、可编辑测试用例和覆盖备份保存在 VS Code 的工作区私有存储中，不会写入项目目录。
+题目信息、可编辑测试用例和覆盖备份保存在每道题目录内的 `.leetcode_cph` 文件夹。API Key 仍只保存在 VS Code Secret Storage 中，绝不会写入该目录。如果不希望把本地测试状态提交到 Git，请在仓库忽略规则中加入 `**/.leetcode_cph/`。
 
 ## 安装
 
@@ -46,13 +50,13 @@ LeetCode CPH 需要同时安装浏览器扩展和 VS Code 插件。
 
 1. 在 VS Code 中打开“扩展”面板。
 2. 点击 `...`，选择“从 VSIX 安装…” 。
-3. 选择 `leetcode-cph-receiver-0.7.1.vsix`（或你构建的更新版本）。
+3. 选择 `leetcode-cph-receiver-0.8.0.vsix`（或你构建的更新版本）。
 4. 安装后重新加载 VS Code。
 
 也可以在终端中安装：
 
 ```powershell
-code --install-extension .\vscode-extension\leetcode-cph-receiver-0.7.1.vsix
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.8.0.vsix
 ```
 
 如需从源码构建 VSIX，请运行：
@@ -75,7 +79,9 @@ npx --yes @vscode/vsce@latest package --no-dependencies
 
 如果已经配置 AI Key，样例提取与 `main.<语言后缀>` 生成会在后台继续。任一任务进行期间，都不能新增、编辑或删除测试用例。
 
-再次抓取同一个已登记题目名称时，会替换它记录中的解答与测试入口文件；替换前会把旧的登记文件备份到扩展私有存储。插件不会覆盖尚未保存的编辑器，请先保存或关闭文件再重新抓取。
+再次抓取题目时，会覆盖原测试记录并开始全新的 AI 提取；旧的自动用例、手动用例和删除记录都不会继续使用。同名但不同的题目也会直接替换原来的登记文件和记录，旧文件备份在 `.leetcode_cph/backups`。插件不会覆盖尚未保存的编辑器，请先保存或关闭文件再重新抓取。
+
+此存储结构刻意不兼容旧版本。原 VS Code 扩展私有区域或题目根目录中的旧记录不会被读取或迁移；升级后请从浏览器重新抓取题目，以创建 `.leetcode_cph`。
 
 ### 2. 配置 AI 并管理测试用例
 
@@ -117,7 +123,7 @@ AI 生成的 `main.<语言后缀>` 是可执行代码，可在受信任的工作
 
 ## 未关联的本地解答
 
-如果工作区中已经存在 `solution.<语言后缀>`，但插件找不到对应的私有题目记录和来源 URL，该文件会被视为“未关联的本地解答”。此时只允许手动新增、编辑和删除测试用例；由于无法安全匹配题目，AI 提取、`main.<语言后缀>` 生成、本地运行和浏览器同步都会被禁用。
+如果工作区中已经存在 `solution.<语言后缀>`，但插件找不到同目录下有效的 `.leetcode_cph` 题目记录和来源 URL，该文件会被视为“未关联的本地解答”。此时只允许手动新增、编辑和删除测试用例；由于无法安全匹配题目，AI 提取、`main.<语言后缀>` 生成、本地运行和浏览器同步都会被禁用。
 
 ## 反馈
 

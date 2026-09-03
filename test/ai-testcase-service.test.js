@@ -451,6 +451,36 @@ test('testcase extraction prompt and JSON parser require verifiable page evidenc
   assert.throws(() => parseExtractedTestCases('{"testCases":[{"input":"n = 1","expectedOutput":"1","evidence":"invented evidence"}]}', extractionMetadata), /证据不在题面中/);
 });
 
+test('LeetCode 150 extraction keeps all three explicit examples in page order', () => {
+  const examples = [
+    {
+      input: 'tokens = ["2","1","+","3","*"]',
+      expectedOutput: '9',
+      evidence: '示例 1：\n输入：tokens = ["2","1","+","3","*"]\n输出：9'
+    },
+    {
+      input: 'tokens = ["4","13","5","/","+"]',
+      expectedOutput: '6',
+      evidence: '示例 2：\n输入：tokens = ["4","13","5","/","+"]\n输出：6'
+    },
+    {
+      input: 'tokens = ["10","6","9","3","+","-11","*","/","*","17","+","5","+"]',
+      expectedOutput: '22',
+      evidence: '示例 3：\n输入：tokens = ["10","6","9","3","+","-11","*","/","*","17","+","5","+"]\n输出：22'
+    }
+  ];
+  const extractionMetadata = {
+    title: '150. 逆波兰表达式求值',
+    source: 'https://leetcode.cn/problems/evaluate-reverse-polish-notation/',
+    samples: examples.map((item) => item.evidence).join('\n\n')
+  };
+
+  assert.deepEqual(
+    parseExtractedTestCases(JSON.stringify({ testCases: examples }), extractionMetadata),
+    examples
+  );
+});
+
 test('provider response errors are useful but redact the API key', async () => {
   const apiKey = 'secret-that-must-not-appear';
   const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
