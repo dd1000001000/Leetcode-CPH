@@ -74,6 +74,24 @@ test('sidebar problem scope changes when the same private record is recaptured',
   assert.notEqual(first, second);
 });
 
+test('test scaffold status uses four concise states with live generation taking priority', () => {
+  const sandbox = loadExtension({ workspace: { textDocuments: [] }, window: {} });
+  const status = (input) => ({ ...sandbox.scaffoldStatusPresentation(input) });
+
+  assert.deepEqual(status({ hasScaffold: true }), {
+    kind: 'generated', text: '测试脚手架已生成'
+  });
+  assert.deepEqual(status({ hasScaffold: true, generationActive: true, stale: true }), {
+    kind: 'generating', text: '测试脚手架正在生成'
+  });
+  assert.deepEqual(status({ hasScaffold: true, stale: true }), {
+    kind: 'stale', text: '测试脚手架可能不是最新版本'
+  });
+  assert.deepEqual(status({ hasScaffold: false, stale: true }), {
+    kind: 'missing', text: '测试脚手架未生成'
+  });
+});
+
 test('sidebar notice expires after 15 seconds and stale dismissal cannot clear a newer notice', () => {
   const timers = [];
   const cleared = [];
@@ -113,6 +131,90 @@ test('sidebar notice expires after 15 seconds and stale dismissal cannot clear a
   const dismissed = sandbox.runtimeStateFor(null);
   assert.equal(dismissed.notice, '');
   assert.ok(dismissed.noticeRevision > third.noticeRevision);
+});
+
+test('sidebar errors expire after 15 seconds and stale dismissal cannot clear a newer error', () => {
+  const timers = [];
+  const cleared = [];
+  const sandbox = loadExtension(
+    { workspace: { textDocuments: [] }, window: {} },
+    {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { if (timer) cleared.push(timer); }
+    }
+  );
+  sandbox.setSidebarRuntime({ error: '第一条错误' });
+  const first = sandbox.runtimeStateFor(null);
+  assert.equal(first.error, '第一条错误');
+  assert.ok(Number.isSafeInteger(first.errorRevision));
+  assert.equal(timers.at(-1).delay, 15_000);
+
+  sandbox.setSidebarRuntime({ error: '第二条错误' });
+  const second = sandbox.runtimeStateFor(null);
+  assert.ok(second.errorRevision > first.errorRevision);
+  assert.ok(cleared.includes(timers[0]));
+  sandbox.dismissSidebarError(first.errorRevision);
+  assert.equal(sandbox.runtimeStateFor(null).error, '第二条错误');
+  timers[0].callback();
+  assert.equal(sandbox.runtimeStateFor(null).error, '第二条错误');
+  sandbox.dismissSidebarError(second.errorRevision);
+  assert.equal(sandbox.runtimeStateFor(null).error, '');
+  assert.ok(cleared.includes(timers[1]));
+
+  sandbox.setSidebarRuntime({ error: '第三条错误' });
+  const third = sandbox.runtimeStateFor(null);
+  timers.at(-1).callback();
+  const dismissed = sandbox.runtimeStateFor(null);
+  assert.equal(dismissed.error, '');
+  assert.ok(dismissed.errorRevision > third.errorRevision);
+});
+
+test('problem-read errors enter the same transient error lifecycle', async () => {
+  const timers = [];
+  const sandbox = loadExtension(
+    { workspace: { textDocuments: [] }, window: {} },
+    {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      }
+    }
+  );
+  vm.runInContext("activeProblemContext = async () => { throw new Error('题目信息损坏'); };", sandbox);
+
+  const state = await sandbox.sidebarState();
+  assert.equal(state.error, '题目信息损坏');
+  assert.equal(sandbox.runtimeStateFor(null).error, '题目信息损坏');
+  assert.equal(timers.at(-1).delay, 15_000);
+  timers.at(-1).callback();
+  assert.equal(sandbox.runtimeStateFor(null).error, '');
+});
+
+test('showing an error clears an existing notice and its stale timer cannot clear the error', () => {
+  const timers = [];
+  const sandbox = loadExtension(
+    { workspace: { textDocuments: [] }, window: {} },
+    {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      }
+    }
+  );
+  sandbox.setSidebarRuntime({ notice: '正在处理…' });
+  const noticeTimer = timers.at(-1);
+  sandbox.setSidebarRuntime({ notice: '', error: '处理失败' });
+  const state = sandbox.runtimeStateFor(null);
+  assert.equal(state.notice, '');
+  assert.equal(state.error, '处理失败');
+  noticeTimer.callback();
+  assert.equal(sandbox.runtimeStateFor(null).error, '处理失败');
 });
 
 test('sidebar keeps the problem context when testcase.* is active and uses an unsaved solution buffer', async () => {
@@ -1332,6 +1434,8 @@ test('an unlinked solution supports manual cases but never AI, execution, or URL
   assert.equal(state.problem.localOnly, true);
   assert.equal(state.problem.canSync, false);
   assert.equal(state.problem.scaffoldReady, false);
+  assert.equal(state.problem.scaffoldStatus, '测试脚手架未生成');
+  assert.equal(state.problem.scaffoldStatusKind, 'missing');
 
   const added = await sandbox.mutateTestCaseAndScaffold('add', {});
   assert.equal(added.localOnly, true);
@@ -1563,7 +1667,8 @@ test('capture defers remote AI extraction and scaffold generation until processC
     document: { uri: { scheme: 'file', fsPath: saved.solution }, getText: () => 'browser_code = True\n' }
   };
   const interruptedState = await sandbox.sidebarState();
-  assert.match(interruptedState.problem.scaffoldStatus, /VS Code 重载而中断/);
+  assert.equal(interruptedState.problem.scaffoldStatus, '测试脚手架未生成');
+  assert.equal(interruptedState.problem.scaffoldStatusKind, 'missing');
   assert.equal(interruptedState.problem.scaffoldReady, false);
 
   // Simulate a manual case already persisted in the private store. An empty

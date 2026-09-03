@@ -37,15 +37,38 @@ function makeView() {
 test('sidebar provider renders a CSP-protected testcase UI', () => {
   const html = getWebviewHtml('nonce-for-test');
   assert.match(html, /Content-Security-Policy/);
+  assert.match(html, /<h1 id="page-title">LeetCode 测试用例<\/h1>/);
+  assert.equal((html.match(/<h1\b/g) || []).length, 1);
+  assert.doesNotMatch(html, /id="problem-title"/);
+  assert.doesNotMatch(html, /class="problem-title"/);
+  assert.doesNotMatch(html, /打开一个 LeetCode solution 文件以查看测试用例/);
+  assert.match(html, /getElementById\('page-title'\)/);
+  assert.match(html, /problem\.language \? ' · ' \+ problem\.language : ''/);
+  assert.match(html, /problem\.title \+ language/);
+  assert.match(html, /\.scaffold-status\.generated \{ color: var\(--vscode-testing-iconPassed/);
+  assert.match(html, /\.scaffold-status\.generating \{ color: var\(--vscode-charts-blue/);
+  assert.match(html, /\.scaffold-status\.stale \{ color: var\(--vscode-editorWarning-foreground/);
+  assert.match(html, /\.scaffold-status\.missing \{ color: var\(--vscode-testing-iconFailed/);
+  assert.match(html, /scaffoldKinds = new Set\(\['generated', 'generating', 'stale', 'missing'\]\)/);
+  assert.match(html, /problem\.scaffoldStatusKind/);
   assert.match(html, /\+新增测试用例/);
   assert.doesNotMatch(html, /id="case-input"/);
   assert.doesNotMatch(html, /id="case-output"/);
   assert.match(html, /className = 'small-button save-button'/);
-  assert.match(html, /save\.textContent = '保存'/);
+  assert.doesNotMatch(html, /save\.textContent = '保存'/);
+  assert.match(html, /save\.setAttribute\('aria-label', '保存此测试用例'\)/);
+  assert.match(html, /appendButtonIcon\(save, 'M2 1h9l3 3v11H2V1z/);
+  assert.match(html, /createElementNS\('http:\/\/www\.w3\.org\/2000\/svg', 'svg'\)/);
+  assert.match(html, /run\.className = 'small-button run-button'/);
+  assert.match(html, /remove\.className = 'icon-button delete-button'/);
+  assert.match(html, /\.icon-button, \.small-button \{[^}]*width: 32px; height: 32px; min-width: 32px;/);
+  assert.match(html, /\.save-button \{ color: #fff; background: #0e639c; \}/);
   assert.match(html, /className = 'collapse-button'/);
   assert.match(html, /className = 'case-status '/);
   assert.match(html, /className = 'runtime'/);
   assert.match(html, /运行全部测试用例/);
+  assert.match(html, /id="run-all" class="primary run-all-button"/);
+  assert.match(html, /button\.run-all-button \{ color: #fff; background: #0e639c;/);
   assert.match(html, /实际输出/);
   assert.doesNotMatch(html, /差异（预期 \/ 实际）/);
   assert.doesNotMatch(html, /appendOutputDiff/);
@@ -58,6 +81,12 @@ test('sidebar provider renders a CSP-protected testcase UI', () => {
   assert.match(html, /id="notice-dismiss"/);
   assert.match(html, /关闭通知/);
   assert.match(html, /dismissNotice\(Number\(state\.noticeRevision/);
+  assert.match(html, /id="error-text"/);
+  assert.match(html, /id="error-dismiss"/);
+  assert.match(html, /关闭错误信息/);
+  assert.match(html, /dismissError\(Number\(state\.errorRevision/);
+  assert.match(html, /setTimeout\(\(\) => dismissError\(revision, key\), 15_000\)/);
+  assert.match(html, /\.message\.notice\.visible, \.message\.error\.visible \{ display: flex; \}/);
 });
 
 test('sidebar provider forwards manual testcase and sidebar actions', async () => {
@@ -65,6 +94,8 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
   const provider = new LeetCodeCphSidebarProvider({
     onReady: () => calls.push(['ready']),
     onDismissNotice: (payload) => { calls.push(['dismiss-notice', payload]); return { notice: '' }; },
+    onDismissError: (payload) => { calls.push(['dismiss-error', payload]); return { error: '' }; },
+    onShowError: (payload) => { calls.push(['show-error', payload]); return { error: payload.message, errorRevision: 8 }; },
     onAdd: (payload) => calls.push(['add', payload]),
     onUpdate: (payload) => calls.push(['update', payload]),
     onDelete: (payload) => calls.push(['delete', payload]),
@@ -93,6 +124,8 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
   await view.send({ type: 'configureAI' });
   await view.send({ type: 'openBugReport' });
   await view.send({ type: 'dismissNotice', revision: 7 });
+  await view.send({ type: 'showError', message: '输入无效' });
+  await view.send({ type: 'dismissError', revision: 8 });
 
   assert.deepEqual(calls, [
     ['ready'],
@@ -105,7 +138,9 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
     ['regenerate', { problemKey: 'problem-a' }],
     ['configure'],
     ['bug'],
-    ['dismiss-notice', { revision: 7 }]
+    ['dismiss-notice', { revision: 7 }],
+    ['show-error', { message: '输入无效' }],
+    ['dismiss-error', { revision: 8 }]
   ]);
   assert.equal(view.webview.options.enableScripts, true);
   assert.equal(view.received.at(-1).state.problem.title, '1. Two Sum');
@@ -135,6 +170,27 @@ test('sidebar notice can be dismissed while another action is still in flight', 
   provider.dispose();
 });
 
+test('sidebar error can be dismissed while another action is still in flight', async () => {
+  let release;
+  const calls = [];
+  const provider = new LeetCodeCphSidebarProvider({
+    onAdd: async () => new Promise((resolve) => { release = resolve; }),
+    onDismissError: (payload) => { calls.push(payload); return { error: '' }; }
+  });
+  provider.setState({ error: '运行失败。', errorRevision: 12 });
+  const view = makeView();
+  provider.resolveWebviewView(view);
+
+  const pendingAction = view.send({ type: 'addTestCase' });
+  await Promise.resolve();
+  await view.send({ type: 'dismissError', revision: 12 });
+  assert.deepEqual(calls, [{ revision: 12 }]);
+  assert.equal(view.received.at(-1).state.error, '');
+  release();
+  await pendingAction;
+  provider.dispose();
+});
+
 test('sidebar callback failures become a safe visible error state', async () => {
   const provider = new LeetCodeCphSidebarProvider({
     onSync: async () => { throw new Error('AI 服务不可用'); }
@@ -143,6 +199,7 @@ test('sidebar callback failures become a safe visible error state', async () => 
   provider.resolveWebviewView(view);
   await view.send({ type: 'sync' });
   assert.equal(view.received.at(-1).state.error, 'AI 服务不可用');
+  assert.equal(view.received.at(-1).state.errorRevision, 1);
   assert.equal(view.received.at(-1).state.busy, false);
   provider.dispose();
 });
