@@ -4,7 +4,7 @@
 // AI calls, process execution, and all secrets. No API key or raw provider
 // response is ever sent into this browser context.
 //
-// Messages: ready, dismissNotice, addTestCase, updateTestCase, deleteTestCase,
+// Messages: ready, dismissNotice, dismissError, showError, addTestCase, updateTestCase, deleteTestCase,
 // runTestCase, runAllTestCases, sync, regenerateScaffold, configureAI,
 // openBugReport.
 
@@ -18,7 +18,8 @@ const DEFAULT_STATE = Object.freeze({
   testResults: {},
   notice: '',
   noticeRevision: 0,
-  error: ''
+  error: '',
+  errorRevision: 0
 });
 
 class LeetCodeCphSidebarProvider {
@@ -73,9 +74,14 @@ class LeetCodeCphSidebarProvider {
 
   async _receiveMessage(message) {
     if (!message || typeof message.type !== 'string') return;
+    if (message.type === 'showError') {
+      await this._reportError(typeof message.message === 'string' ? message.message.slice(0, 2000) : '操作失败，请稍后重试。');
+      return;
+    }
     const handlers = {
       ready: this._callbacks.onReady,
       dismissNotice: this._callbacks.onDismissNotice || (() => ({ notice: '' })),
+      dismissError: this._callbacks.onDismissError || (() => ({ error: '' })),
       addTestCase: this._callbacks.onAdd,
       updateTestCase: this._callbacks.onUpdate,
       deleteTestCase: this._callbacks.onDelete,
@@ -93,14 +99,14 @@ class LeetCodeCphSidebarProvider {
       || message.type === 'updateTestCase'
       || message.type === 'deleteTestCase';
     if (testcaseMutation && this._state.problem?.aiBusy) {
-      this.setState({ error: 'AI 正在提取测试用例或更新 main 测试代码，请等待完成后再修改。' });
+      await this._reportError('AI 正在提取测试用例或更新 main 测试代码，请等待完成后再修改。');
       return;
     }
 
     // A disabled button alone cannot prevent two queued postMessage events.
     // The host additionally serializes mutations per problem; this guard keeps
     // the webview from issuing a duplicate action before its next render.
-    const isAction = message.type !== 'ready' && message.type !== 'dismissNotice';
+    const isAction = message.type !== 'ready' && message.type !== 'dismissNotice' && message.type !== 'dismissError';
     if (isAction && this._actionInFlight) return;
     if (isAction) this._actionInFlight = true;
     try {
@@ -111,9 +117,9 @@ class LeetCodeCphSidebarProvider {
         busy: false,
         testcaseMutationBusy: false,
         runBusy: false,
-        runningCaseId: '',
-        error: error?.message || '操作失败，请稍后重试。'
+        runningCaseId: ''
       });
+      await this._reportError(error?.message || '操作失败，请稍后重试。');
     } finally {
       if (isAction) this._actionInFlight = false;
     }
@@ -140,10 +146,21 @@ class LeetCodeCphSidebarProvider {
       case 'regenerateScaffold':
         return { problemKey };
       case 'dismissNotice':
+      case 'dismissError':
         return { revision: Number.isSafeInteger(message.revision) ? message.revision : -1 };
       default:
         return undefined;
     }
+  }
+
+  async _reportError(message) {
+    const text = String(message || '操作失败，请稍后重试。').slice(0, 2000);
+    if (typeof this._callbacks.onShowError === 'function') {
+      const statePatch = await this._callbacks.onShowError({ message: text });
+      if (statePatch && typeof statePatch === 'object') this.setState(statePatch);
+      return;
+    }
+    this.setState({ error: text, errorRevision: Number(this._state.errorRevision || 0) + 1 });
   }
 
   _postState() {
@@ -179,18 +196,22 @@ function getWebviewHtml(nonce) {
     body { margin: 0; padding: 12px; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
     button, textarea { font: inherit; }
     .header { margin-bottom: 12px; }
-    h1 { font-size: 15px; margin: 0 0 5px; font-weight: 650; }
-    .problem-title { color: var(--vscode-descriptionForeground); display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+    h1 { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 15px; line-height: 1.35; margin: 0 0 5px; font-weight: 650; }
     .ai-status, .scaffold-status { color: var(--vscode-descriptionForeground); margin-top: 4px; line-height: 1.35; font-size: 11px; }
-    .scaffold-status { color: var(--vscode-editorWarning-foreground); font-weight: 650; }
+    .scaffold-status { font-weight: 650; }
+    .scaffold-status.generated { color: var(--vscode-testing-iconPassed, #73c991); }
+    .scaffold-status.generating { color: var(--vscode-charts-blue, #3794ff); }
+    .scaffold-status.stale { color: var(--vscode-editorWarning-foreground, #cca700); }
+    .scaffold-status.missing { color: var(--vscode-testing-iconFailed, #f14c4c); }
     .message { display: none; border-radius: 4px; margin: 0 0 10px; padding: 8px; line-height: 1.4; }
     .message.visible { display: block; }
-    .message.notice { align-items: flex-start; gap: 8px; background: var(--vscode-inputValidation-infoBackground); border: 1px solid var(--vscode-inputValidation-infoBorder); }
-    .message.notice.visible { display: flex; }
-    .notice-text { flex: 1; min-width: 0; white-space: pre-wrap; }
-    .notice-dismiss { flex: 0 0 auto; width: 20px; height: 20px; min-width: 20px; padding: 0; border: 0; border-radius: 3px; color: var(--vscode-foreground); background: transparent; cursor: pointer; font-size: 16px; line-height: 18px; }
-    .notice-dismiss:hover { background: var(--vscode-toolbar-hoverBackground); }
+    .message.notice, .message.error { align-items: flex-start; gap: 8px; }
+    .message.notice.visible, .message.error.visible { display: flex; }
+    .message.notice { background: var(--vscode-inputValidation-infoBackground); border: 1px solid var(--vscode-inputValidation-infoBorder); }
     .message.error { background: var(--vscode-inputValidation-errorBackground); border: 1px solid var(--vscode-inputValidation-errorBorder); }
+    .message-text { flex: 1; min-width: 0; white-space: pre-wrap; }
+    .message-dismiss { flex: 0 0 auto; width: 20px; height: 20px; min-width: 20px; padding: 0; border: 0; border-radius: 3px; color: var(--vscode-foreground); background: transparent; cursor: pointer; font-size: 16px; line-height: 18px; }
+    .message-dismiss:hover { background: var(--vscode-toolbar-hoverBackground); }
     .empty { color: var(--vscode-descriptionForeground); border: 1px dashed var(--vscode-widget-border); border-radius: 5px; padding: 14px 10px; text-align: center; line-height: 1.45; }
     .case-list { display: grid; gap: 7px; }
     .case { border: 1px solid var(--vscode-widget-border); border-radius: 3px; overflow: hidden; background: var(--vscode-editor-background); }
@@ -209,16 +230,20 @@ function getWebviewHtml(nonce) {
     textarea { display: block; resize: vertical; width: 100%; min-height: 58px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 2px; margin: 0 0 9px; padding: 6px; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }
     textarea:focus, button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
     pre { margin: 0 0 9px; max-height: 160px; overflow: auto; padding: 7px; white-space: pre-wrap; word-break: break-word; color: var(--vscode-editor-foreground); background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-input-border); border-radius: 2px; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }
-    .icon-button, .small-button { min-width: 0; border: 0; border-radius: 3px; cursor: pointer; padding: 4px 7px; }
-    .save-button { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
-    .run-button { min-width: 30px; color: #fff; background: #4f8f25; font-size: 15px; }
+    .icon-button, .small-button { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 32px; width: 32px; height: 32px; min-width: 32px; border: 0; border-radius: 3px; cursor: pointer; padding: 0; }
+    .button-icon { width: 16px; height: 16px; fill: currentColor; pointer-events: none; }
+    .save-button { color: #fff; background: #0e639c; }
+    .save-button:hover { background: #1177bb; }
+    .run-button { color: #fff; background: #4f8f25; font-size: 15px; }
     .run-button:hover { background: #5da52c; }
-    .delete-button { min-width: 30px; color: #fff; background: #c72d4c; font-size: 14px; }
+    .delete-button { color: #fff; background: #c72d4c; font-size: 14px; }
     .delete-button:hover { background: #da3456; }
     .actions { display: grid; grid-template-columns: 1fr; gap: 7px; margin-top: 14px; }
     button.primary, button.secondary, button.success { border: 0; border-radius: 3px; cursor: pointer; min-height: 30px; padding: 5px 9px; }
     button.primary { color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
     button.primary:hover { background: var(--vscode-button-hoverBackground); }
+    button.run-all-button { color: #fff; background: #0e639c; font-weight: 650; }
+    button.run-all-button:hover { background: #1177bb; }
     button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
     button.success { color: #fff; background: #388a25; font-weight: 650; }
@@ -237,22 +262,24 @@ function getWebviewHtml(nonce) {
 <body>
   <main>
     <div class="header">
-      <h1>LeetCode 测试用例</h1>
-      <div id="problem-title" class="problem-title">打开一个 LeetCode solution 文件以查看测试用例</div>
+      <h1 id="page-title">LeetCode 测试用例</h1>
       <div id="ai-status" class="ai-status" hidden></div>
       <div id="scaffold-status" class="scaffold-status" hidden></div>
     </div>
     <div id="notice" class="message notice" role="status">
-      <span id="notice-text" class="notice-text"></span>
-      <button id="notice-dismiss" class="notice-dismiss" type="button" title="关闭通知" aria-label="关闭通知">×</button>
+      <span id="notice-text" class="message-text"></span>
+      <button id="notice-dismiss" class="message-dismiss" type="button" title="关闭通知" aria-label="关闭通知">×</button>
     </div>
-    <div id="error" class="message error" role="alert"></div>
+    <div id="error" class="message error" role="alert">
+      <span id="error-text" class="message-text"></span>
+      <button id="error-dismiss" class="message-dismiss" type="button" title="关闭错误信息" aria-label="关闭错误信息">×</button>
+    </div>
     <section aria-label="测试用例">
       <div id="empty" class="empty">当前题目还没有测试用例。配置 AI 后可从题面提取测试用例，或点击下方按钮新增。</div>
       <div id="case-list" class="case-list"></div>
     </section>
     <div class="actions">
-      <button id="run-all" class="primary" type="button">运行全部测试用例</button>
+      <button id="run-all" class="primary run-all-button" type="button">运行全部测试用例</button>
       <button id="add-case" class="success" type="button">+新增测试用例</button>
     </div>
     <button id="sync" class="primary sync" type="button">同步代码到 LeetCode</button>
@@ -264,11 +291,10 @@ function getWebviewHtml(nonce) {
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const state = { problem: null, testCases: [], busy: false, testcaseMutationBusy: false, runBusy: false, runningCaseId: '', testResults: {}, notice: '', noticeRevision: 0, error: '' };
+    const state = { problem: null, testCases: [], busy: false, testcaseMutationBusy: false, runBusy: false, runningCaseId: '', testResults: {}, notice: '', noticeRevision: 0, error: '', errorRevision: 0 };
     const elements = {
-      title: document.getElementById('problem-title'), aiStatus: document.getElementById('ai-status'), scaffoldStatus: document.getElementById('scaffold-status'), notice: document.getElementById('notice'), noticeText: document.getElementById('notice-text'), noticeDismiss: document.getElementById('notice-dismiss'), error: document.getElementById('error'), empty: document.getElementById('empty'), list: document.getElementById('case-list'), add: document.getElementById('add-case'), runAll: document.getElementById('run-all'), sync: document.getElementById('sync'), configure: document.getElementById('configure-ai'), bug: document.getElementById('bug-report'), regenerate: document.getElementById('regenerate-scaffold')
+      title: document.getElementById('page-title'), aiStatus: document.getElementById('ai-status'), scaffoldStatus: document.getElementById('scaffold-status'), notice: document.getElementById('notice'), noticeText: document.getElementById('notice-text'), noticeDismiss: document.getElementById('notice-dismiss'), error: document.getElementById('error'), errorText: document.getElementById('error-text'), errorDismiss: document.getElementById('error-dismiss'), empty: document.getElementById('empty'), list: document.getElementById('case-list'), add: document.getElementById('add-case'), runAll: document.getElementById('run-all'), sync: document.getElementById('sync'), configure: document.getElementById('configure-ai'), bug: document.getElementById('bug-report'), regenerate: document.getElementById('regenerate-scaffold')
     };
-    function displayMessage(element, text) { element.textContent = text || ''; element.classList.toggle('visible', Boolean(text)); }
     let dismissedNoticeRevision = null;
     function dismissNotice(revision) {
       if (!state.notice || revision !== Number(state.noticeRevision || 0)) return;
@@ -279,6 +305,22 @@ function getWebviewHtml(nonce) {
     function displayNotice(text) {
       const revision = Number(state.noticeRevision || 0); const visible = Boolean(text) && dismissedNoticeRevision !== revision;
       elements.noticeText.textContent = visible ? text : ''; elements.notice.classList.toggle('visible', visible);
+    }
+    let dismissedErrorKey = ''; let activeErrorKey = ''; let errorTimer;
+    function currentErrorKey() { return String(Number(state.errorRevision || 0)) + '\u0000' + String(state.error || ''); }
+    function dismissError(revision, expectedKey) {
+      const key = currentErrorKey();
+      if (!state.error || revision !== Number(state.errorRevision || 0) || (expectedKey && expectedKey !== key)) return;
+      dismissedErrorKey = key; activeErrorKey = ''; clearTimeout(errorTimer); errorTimer = undefined;
+      elements.error.classList.remove('visible'); elements.errorText.textContent = '';
+      vscode.postMessage({ type: 'dismissError', revision });
+    }
+    function displayError(text) {
+      const revision = Number(state.errorRevision || 0); const key = currentErrorKey(); const visible = Boolean(text) && dismissedErrorKey !== key;
+      elements.errorText.textContent = visible ? text : ''; elements.error.classList.toggle('visible', visible);
+      if (!visible) { activeErrorKey = ''; clearTimeout(errorTimer); errorTimer = undefined; return; }
+      if (activeErrorKey === key) return;
+      activeErrorKey = key; clearTimeout(errorTimer); errorTimer = setTimeout(() => dismissError(revision, key), 15_000);
     }
     function testCaseName(testCase, index) { return testCase.name || ('testcase ' + String(index + 1).padStart(3, '0')); }
     function displayedTestCaseName(testCase, index) {
@@ -321,7 +363,7 @@ function getWebviewHtml(nonce) {
       for (const key of drafts.keys()) if (key.startsWith(prefix) && !activeIds.has(key)) drafts.delete(key);
       return [...drafts.keys()].some((key) => activeIds.has(key));
     }
-    function showDraftWarning() { displayMessage(elements.error, '请先保存或还原正在编辑的测试用例，再执行其他操作。'); }
+    function showDraftWarning() { vscode.postMessage({ type: 'showError', message: '请先保存或还原正在编辑的测试用例，再执行其他操作。' }); }
     function refreshGlobalControls() {
       const problem = state.problem || {}; const hasProblem = Boolean(problem.title); const testCases = Array.isArray(state.testCases) ? state.testCases : [];
       const mutationLocked = Boolean(state.busy || state.testcaseMutationBusy || problem.aiBusy); const actionLocked = Boolean(state.busy || state.testcaseMutationBusy || state.runBusy || problem.aiBusy); const canMutate = hasProblem; const scaffoldReady = Boolean(problem.scaffoldReady); const runnerSupported = Boolean(problem.runnerSupported); const draftLocked = hasUnsavedDrafts(testCases);
@@ -335,6 +377,10 @@ function getWebviewHtml(nonce) {
     function appendReadOnly(container, label, value, className, outputId) {
       const fieldLabel = document.createElement('span'); fieldLabel.id = outputId + '-label'; fieldLabel.className = 'field-label' + (className ? ' ' + className : ''); fieldLabel.textContent = label;
       const code = document.createElement('pre'); code.id = outputId; code.setAttribute('aria-labelledby', fieldLabel.id); code.textContent = value == null || value === '' ? '（空）' : String(value); container.append(fieldLabel, code);
+    }
+    function appendButtonIcon(button, pathData) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.classList.add('button-icon'); svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('focusable', 'false');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', pathData); svg.append(path); button.append(svg);
     }
     function resultFor(testCase) { const all = state.testResults && typeof state.testResults === 'object' ? state.testResults : {}; return all[String(testCase.id)] || all[testCase.name] || null; }
     function resultStatus(result) {
@@ -362,7 +408,8 @@ function getWebviewHtml(nonce) {
     }
     function render() {
       const problem = state.problem || {}; const hasProblem = Boolean(problem.title); const language = problem.language ? ' · ' + problem.language : '';
-      elements.title.textContent = hasProblem ? problem.title + language : '打开一个 LeetCode solution 文件以查看测试用例'; elements.aiStatus.textContent = problem.aiStatus || ''; elements.aiStatus.hidden = !problem.aiStatus; elements.scaffoldStatus.textContent = problem.scaffoldStatus || ''; elements.scaffoldStatus.hidden = !problem.scaffoldStatus; displayNotice(state.notice); displayMessage(elements.error, state.error);
+      const pageTitle = hasProblem ? problem.title + language : 'LeetCode 测试用例'; elements.title.textContent = pageTitle; elements.title.title = pageTitle; elements.aiStatus.textContent = problem.aiStatus || ''; elements.aiStatus.hidden = !problem.aiStatus;
+      const scaffoldKinds = new Set(['generated', 'generating', 'stale', 'missing']); const scaffoldKind = scaffoldKinds.has(problem.scaffoldStatusKind) ? problem.scaffoldStatusKind : 'missing'; elements.scaffoldStatus.className = 'scaffold-status ' + scaffoldKind; elements.scaffoldStatus.textContent = problem.scaffoldStatus || ''; elements.scaffoldStatus.hidden = !problem.scaffoldStatus; displayNotice(state.notice); displayError(state.error);
       const testCases = Array.isArray(state.testCases) ? state.testCases : []; const mutationLocked = Boolean(state.busy || state.testcaseMutationBusy || problem.aiBusy); const actionLocked = Boolean(state.busy || state.testcaseMutationBusy || state.runBusy || problem.aiBusy); const canMutate = hasProblem; const scaffoldReady = Boolean(problem.scaffoldReady); const runnerSupported = Boolean(problem.runnerSupported); const draftLocked = hasUnsavedDrafts(testCases);
       elements.list.replaceChildren(); elements.empty.hidden = testCases.length > 0;
       testCases.forEach((rawTestCase, index) => {
@@ -373,7 +420,7 @@ function getWebviewHtml(nonce) {
         if (statusInfo) { const status = document.createElement('span'); status.className = 'case-status ' + statusInfo.status; status.textContent = statusInfo.text; header.append(collapse, name, status); } else header.append(collapse, name);
         if (runtime) { const duration = document.createElement('span'); duration.className = 'runtime'; duration.textContent = runtime; header.append(duration); }
         const actions = document.createElement('div'); actions.className = 'case-actions';
-        const save = document.createElement('button'); save.className = 'small-button save-button'; save.type = 'button'; save.textContent = '保存'; save.title = '保存此测试用例';
+        const save = document.createElement('button'); save.className = 'small-button save-button'; save.type = 'button'; save.title = '保存此测试用例'; save.setAttribute('aria-label', '保存此测试用例'); appendButtonIcon(save, 'M2 1h9l3 3v11H2V1zm1 1v12h10V4.5L10.5 2H10v4H4V2H3zm2 0v3h4V2H5zm0 7h6v4H5V9zm1 1v2h4v-2H6z');
         const run = document.createElement('button'); run.className = 'small-button run-button'; run.type = 'button'; run.textContent = state.runBusy && String(state.runningCaseId) === String(testCase.id) ? '…' : '▶'; run.title = '运行此测试用例'; run.setAttribute('aria-label', '运行此测试用例'); run.hidden = !runnerSupported; run.disabled = actionLocked || draftLocked || !scaffoldReady || !runnerSupported || !hasRunnableData(input, expected); run.addEventListener('click', () => { if (hasUnsavedDrafts(testCases)) return showDraftWarning(); vscode.postMessage({ type: 'runTestCase', id: String(testCase.id), problemKey: draftScope() }); });
         const remove = document.createElement('button'); remove.className = 'icon-button delete-button'; remove.type = 'button'; remove.textContent = '🗑'; remove.title = '删除此测试用例'; remove.setAttribute('aria-label', '删除此测试用例'); remove.disabled = mutationLocked || draftLocked || !canMutate; remove.addEventListener('click', () => { if (hasUnsavedDrafts(testCases)) return showDraftWarning(); vscode.postMessage({ type: 'deleteTestCase', id: String(testCase.id), problemKey: draftScope() }); }); actions.append(save, run, remove); header.append(actions);
         const setCollapsed = (collapsed) => { card.classList.toggle('collapsed', collapsed); content.hidden = collapsed; collapse.textContent = collapsed ? '⌄' : '⌃'; collapse.title = collapsed ? '展开测试用例' : '折叠测试用例'; collapse.setAttribute('aria-label', collapse.title); collapse.setAttribute('aria-expanded', String(!collapsed)); };
@@ -395,7 +442,7 @@ function getWebviewHtml(nonce) {
       });
       refreshGlobalControls();
     }
-    elements.noticeDismiss.addEventListener('click', () => dismissNotice(Number(state.noticeRevision || 0))); elements.add.addEventListener('click', () => postAction('addTestCase')); elements.runAll.addEventListener('click', () => postAction('runAllTestCases')); elements.sync.addEventListener('click', () => postAction('sync')); elements.regenerate.addEventListener('click', () => postAction('regenerateScaffold')); elements.configure.addEventListener('click', () => postAction('configureAI')); elements.bug.addEventListener('click', () => postAction('openBugReport'));
+    elements.noticeDismiss.addEventListener('click', () => dismissNotice(Number(state.noticeRevision || 0))); elements.errorDismiss.addEventListener('click', () => dismissError(Number(state.errorRevision || 0))); elements.add.addEventListener('click', () => postAction('addTestCase')); elements.runAll.addEventListener('click', () => postAction('runAllTestCases')); elements.sync.addEventListener('click', () => postAction('sync')); elements.regenerate.addEventListener('click', () => postAction('regenerateScaffold')); elements.configure.addEventListener('click', () => postAction('configureAI')); elements.bug.addEventListener('click', () => postAction('openBugReport'));
     window.addEventListener('message', (event) => { if (event.data?.type !== 'state' || !event.data.state) return; Object.assign(state, event.data.state); render(); }); render(); vscode.postMessage({ type: 'ready' });
   </script>
 </body>

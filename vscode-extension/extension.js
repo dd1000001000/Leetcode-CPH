@@ -57,6 +57,7 @@ const RECEIVER_PORT = 27121;
 const COMPANION_EXTENSION_ID = 'lenchpcbgdkafhhfoeobicafbfhgklna';
 const COMPANION_EXTENSION_ORIGIN = `chrome-extension://${COMPANION_EXTENSION_ID}`;
 const SIDEBAR_NOTICE_TIMEOUT_MS = 15_000;
+const SIDEBAR_ERROR_TIMEOUT_MS = 15_000;
 // Keep transient sidebar state outside refreshSidebar().  Captures and active
 // editor changes can refresh the view while an AI mutation is in progress;
 // recreating `busy: false` during that window would prematurely re-enable the
@@ -70,7 +71,8 @@ const sidebarRuntime = {
   resultFolder: '',
   notice: '',
   noticeRevision: 0,
-  error: ''
+  error: '',
+  errorRevision: 0
 };
 
 const EXTENSIONS = {
@@ -1146,6 +1148,7 @@ const MAX_SOCKET_FRAME_BYTES = 65_535;
 const MAX_SOCKET_BUFFER_BYTES = 128 * 1024;
 let heartbeatTimer;
 let sidebarNoticeTimer;
+let sidebarErrorTimer;
 let sidebarRefreshEpoch = 0;
 
 // The Edge extension lives in a Manifest V3 service worker, which the browser
@@ -1764,9 +1767,14 @@ async function syncActiveSolution(expectedProblemKey) {
 function setSidebarRuntime(patch = {}) {
   sidebarRefreshEpoch += 1;
   const updatesNotice = Object.prototype.hasOwnProperty.call(patch, 'notice');
+  const updatesError = Object.prototype.hasOwnProperty.call(patch, 'error');
   if (updatesNotice) {
     sidebarRuntime.noticeRevision += 1;
     clearSidebarNoticeTimer();
+  }
+  if (updatesError) {
+    sidebarRuntime.errorRevision += 1;
+    clearSidebarErrorTimer();
   }
   Object.assign(sidebarRuntime, patch);
   if (updatesNotice && sidebarRuntime.notice) {
@@ -1779,6 +1787,16 @@ function setSidebarRuntime(patch = {}) {
     sidebarNoticeTimer = timer;
     sidebarNoticeTimer.unref?.();
   }
+  if (updatesError && sidebarRuntime.error) {
+    const revision = sidebarRuntime.errorRevision;
+    const timer = setTimeout(() => {
+      if (sidebarRuntime.errorRevision !== revision || !sidebarRuntime.error || sidebarErrorTimer !== timer) return;
+      sidebarErrorTimer = undefined;
+      setSidebarRuntime({ error: '' });
+    }, SIDEBAR_ERROR_TIMEOUT_MS);
+    sidebarErrorTimer = timer;
+    sidebarErrorTimer.unref?.();
+  }
   sidebarProvider?.setState({
     busy: sidebarRuntime.busy,
     testcaseMutationBusy: sidebarRuntime.testcaseMutationBusy,
@@ -1787,7 +1805,8 @@ function setSidebarRuntime(patch = {}) {
     testResults: sidebarRuntime.testResults,
     notice: sidebarRuntime.notice,
     noticeRevision: sidebarRuntime.noticeRevision,
-    error: sidebarRuntime.error
+    error: sidebarRuntime.error,
+    errorRevision: sidebarRuntime.errorRevision
   });
 }
 
@@ -1796,9 +1815,19 @@ function clearSidebarNoticeTimer() {
   sidebarNoticeTimer = undefined;
 }
 
+function clearSidebarErrorTimer() {
+  clearTimeout(sidebarErrorTimer);
+  sidebarErrorTimer = undefined;
+}
+
 function dismissSidebarNotice(revision) {
   if (!Number.isSafeInteger(revision) || revision !== sidebarRuntime.noticeRevision) return;
   setSidebarRuntime({ notice: '' });
+}
+
+function dismissSidebarError(revision) {
+  if (!Number.isSafeInteger(revision) || revision !== sidebarRuntime.errorRevision) return;
+  setSidebarRuntime({ error: '' });
 }
 
 function clearRunResults(folder) {
@@ -1820,7 +1849,8 @@ function runtimeStateFor(context) {
     testResults: resultMatchesContext ? sidebarRuntime.testResults : {},
     notice: sidebarRuntime.notice,
     noticeRevision: sidebarRuntime.noticeRevision,
-    error: sidebarRuntime.error
+    error: sidebarRuntime.error,
+    errorRevision: sidebarRuntime.errorRevision
   };
 }
 
@@ -1856,6 +1886,13 @@ function assertProblemAiIdle(context) {
   }
 }
 
+function scaffoldStatusPresentation({ hasScaffold, generationActive, stale } = {}) {
+  if (generationActive) return { kind: 'generating', text: '测试脚手架正在生成' };
+  if (hasScaffold && stale) return { kind: 'stale', text: '测试脚手架可能不是最新版本' };
+  if (hasScaffold) return { kind: 'generated', text: '测试脚手架已生成' };
+  return { kind: 'missing', text: '测试脚手架未生成' };
+}
+
 async function sidebarState(extra = {}) {
   const empty = {
     problem: null,
@@ -1867,13 +1904,18 @@ async function sidebarState(extra = {}) {
     testResults: {},
     notice: '',
     noticeRevision: sidebarRuntime.noticeRevision,
-    error: ''
+    error: '',
+    errorRevision: sidebarRuntime.errorRevision
   };
   let context;
   try {
     context = await activeProblemContext({ required: false });
   } catch (error) {
-    return { ...empty, ...runtimeStateFor(null), ...extra, error: extra.error || sidebarRuntime.error || error.message || '无法读取当前题目。' };
+    const message = extra.error || sidebarRuntime.error || error.message || '无法读取当前题目。';
+    if (!sidebarRuntime.error || sidebarRuntime.error !== message) {
+      setSidebarRuntime({ notice: '', error: message });
+    }
+    return { ...empty, ...runtimeStateFor(null), ...extra, error: message, errorRevision: sidebarRuntime.errorRevision };
   }
   if (!context) return { ...empty, ...runtimeStateFor(null), ...extra };
 
@@ -1895,13 +1937,20 @@ async function sidebarState(extra = {}) {
   const extractionPending = persistedExtractionPending && activeCaptureJobs.has(
     captureJobKey(context.folder, context.metadata?.captureRevision)
   );
-  const aiBusy = !context.localOnly && (persistedExtractionPending
+  const generationActive = !context.localOnly && (extractionPending
     || captureJobActiveForFolder(context.folder)
     || activeTestcaseAiJobs.has(pathKey(context.folder)));
+  const aiBusy = !context.localOnly && (persistedExtractionPending
+    || generationActive);
   // Background HTTP work cannot survive an extension-host reload. Do not
   // leave the sidebar permanently disabled by a durable "pending" marker
   // when no task for that exact capture revision exists in this process.
   const extractionInterrupted = persistedExtractionPending && !extractionPending;
+  const scaffoldStatus = scaffoldStatusPresentation({
+    hasScaffold,
+    generationActive,
+    stale: Boolean(context.metadata?.testcaseScaffoldStale) || extractionInterrupted
+  });
   const hasRunnableTestCases = context.testCases.some(testcaseHasRunnableData);
   const scaffoldReady = !context.localOnly && hasScaffold
     && !context.metadata?.testcaseScaffoldStale
@@ -1924,19 +1973,8 @@ async function sidebarState(extra = {}) {
         && !persistedExtractionPending && !aiBusy,
       scaffoldReady,
       runnerSupported,
-      scaffoldStatus: context.localOnly
-        ? '该 solution 没有对应的私有题目记录和 URL；只能手动维护用例，不能使用 AI、同步或运行。'
-        : extractionPending
-        ? '题面和网页代码已保存；AI 正在后台提取测试用例。'
-        : extractionInterrupted
-        ? '上次 AI 处理因 VS Code 重载而中断；请在浏览器重新抓取题目后重试。'
-        : context.metadata?.testcaseScaffoldStale
-        ? context.metadata?.testcaseScaffoldError
-          ? '测试脚手架生成失败；可点击“重新编写测试脚手架”重试。'
-          : '测试脚手架需要更新'
-        : hasScaffold ? runnerSupported
-          ? '测试脚手架已生成，可使用本机对应语言工具链运行测试。'
-          : '测试脚手架已生成，但当前语言不支持本地运行。' : ''
+      scaffoldStatus: scaffoldStatus.text,
+      scaffoldStatusKind: scaffoldStatus.kind
     },
     testCases: context.testCases,
     ...extra
@@ -2170,6 +2208,7 @@ async function regenerateTestScaffold(payload = {}) {
     throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后重试。');
   }
   beginTestcaseAiJob(identityKey);
+  void refreshSidebar();
   try {
     return await withProblemLock(identity.folder, async () => {
       let context = await problemContextFromIdentity(identity);
@@ -2187,6 +2226,7 @@ async function regenerateTestScaffold(payload = {}) {
     });
   } finally {
     endTestcaseAiJob(identityKey);
+    void refreshSidebar();
   }
 }
 
@@ -2446,6 +2486,8 @@ function createSidebar() {
   return new LeetCodeCphSidebarProvider({
     onReady: () => refreshSidebar(),
     onDismissNotice: (payload) => dismissSidebarNotice(payload?.revision),
+    onDismissError: (payload) => dismissSidebarError(payload?.revision),
+    onShowError: (payload) => setSidebarRuntime({ notice: '', error: payload?.message || '操作失败，请稍后重试。' }),
     onAdd: (payload) => runSidebarAction(
       '正在新增空白测试用例…',
       () => mutateTestCaseAndScaffold('add', payload, updateAfterPersist),
@@ -2633,7 +2675,7 @@ function activate(context) {
   sidebarProvider = createSidebar();
   startServer();
   heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
-  context.subscriptions.push(outputChannel, sidebarProvider, { dispose: () => { clearInterval(heartbeatTimer); clearSidebarNoticeTimer(); server?.close(); } });
+  context.subscriptions.push(outputChannel, sidebarProvider, { dispose: () => { clearInterval(heartbeatTimer); clearSidebarNoticeTimer(); clearSidebarErrorTimer(); server?.close(); } });
   if (typeof vscode.window.registerWebviewViewProvider === 'function') {
     context.subscriptions.push(vscode.window.registerWebviewViewProvider(
       LeetCodeCphSidebarProvider.viewType,
@@ -2694,6 +2736,7 @@ function activate(context) {
 function deactivate() {
   clearInterval(heartbeatTimer);
   clearSidebarNoticeTimer();
+  clearSidebarErrorTimer();
   sidebarRefreshEpoch += 1;
   applyTracker?.disposeAll('VS Code 扩展已停止。');
   sidebarProvider?.dispose();
