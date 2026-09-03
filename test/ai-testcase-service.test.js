@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   PROVIDERS,
+  MAX_REPAIR_DIAGNOSTICS_CHARS,
   createAiTestcaseService,
   getConfiguredProviders,
   secretKeyFor,
@@ -110,7 +111,7 @@ test('generation sends the chosen provider request and returns fence-free scaffo
   assert.equal(JSON.stringify(result).includes(apiKey), false);
 });
 
-test('scaffold prompt requires the relative private runtime solution copy and never embeds a user path', async () => {
+test('scaffold prompt requires sibling main and solution files and never embeds a user path', async () => {
   const apiKey = 'runtime-contract-key';
   const userVisiblePath = 'C:\\Users\\Alice\\leetcode\\two-sum.py';
   const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
@@ -127,6 +128,7 @@ test('scaffold prompt requires the relative private runtime solution copy and ne
     metadata: {
       ...metadata,
       runtimeSolutionFileName: 'solution.py',
+      mainFileName: 'main.py',
       solutionPath: userVisiblePath
     },
     solutionCode: 'class Solution:\n    pass',
@@ -136,8 +138,12 @@ test('scaffold prompt requires the relative private runtime solution copy and ne
   });
 
   assert.match(prompt, /"runtimeSolutionFileName": "solution\.py"/);
-  assert.match(prompt, /copied next to this scaffold/i);
-  assert.match(prompt, /exact relative filename/i);
+  assert.match(prompt, /"mainFileName": "main\.py"/);
+  assert.match(prompt, /same problem directory/i);
+  assert.match(prompt, /exact relative solution filename/i);
+  assert.match(prompt, /class LeetCodeCphTest/);
+  assert.match(prompt, /object LeetCodeCphTest/);
+  assert.match(prompt, /TypeScript solutionCode and main are concatenated/);
   assert.match(prompt, /never embed an absolute local path/i);
   assert.equal(prompt.includes(userVisiblePath), false);
 });
@@ -184,6 +190,164 @@ test('initialize generates one scaffold from all captured LeetCode examples with
   assert.match(received.body.messages[1].content, /"type": "initialize"/);
   assert.match(received.body.messages[1].content, /testcase 001/);
   assert.match(received.body.messages[1].content, /testcase 002/);
+});
+
+test('repair sends the existing main and sanitized bounded execution diagnostics while preserving the runner contract', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('qwen')]: 'qwen-key' });
+  const existingScaffold = [
+    'import json',
+    "MARKER = '__LEETCODE_CPH_RESULT__'",
+    "selected = '--case'",
+    "TEST_NAMES = ['testcase 001', 'testcase 002']",
+    'raise SyntaxError("broken main")'
+  ].join('\n');
+  const localPath = 'C:\\Users\\Alice Smith\\leetcode\\Two Sum\\main.py';
+  let prompt = '';
+  const service = createAiTestcaseService({
+    secrets,
+    request: async (request) => {
+      prompt = request.body.messages[1].content;
+      return successfulResponse();
+    }
+  });
+
+  const result = await service.generateScaffold({
+    metadata: { ...metadata, runtimeSolutionFileName: 'solution.py', mainFileName: 'main.py' },
+    solutionCode: 'class Solution:\n    def twoSum(self, nums, target): pass',
+    testCases,
+    operation: {
+      type: 'repair',
+      error: new Error(`SyntaxError in "${localPath}"`),
+      diagnostics: {
+        stage: 'run',
+        stderr: `${localPath}:12: invalid syntax\u001b[31m`,
+        stdout: 'ordinary output '.repeat(MAX_REPAIR_DIAGNOSTICS_CHARS),
+        exitCode: 1
+      }
+    },
+    existingScaffold,
+    provider: 'qwen'
+  });
+
+  assert.match(prompt, /"type": "repair"/);
+  assert.match(prompt, /existing main failed to compile or run/i);
+  assert.match(prompt, /Repair only existingScaffold/i);
+  assert.match(prompt, /invalid syntax/);
+  assert.ok(prompt.indexOf('invalid syntax') < prompt.indexOf('ordinary output'), 'stderr must survive the combined diagnostic cap before stdout');
+  assert.match(prompt, /\[LOCAL_PATH\]\/main\.py/);
+  assert.equal(prompt.includes(localPath), false);
+  assert.equal(prompt.includes('\u001b[31m'), false);
+  assert.match(prompt, /raise SyntaxError\(\\"broken main\\"\)/);
+  assert.match(prompt, /class Solution/);
+  assert.match(prompt, /testcase 001/);
+  assert.match(prompt, /testcase 002/);
+  assert.match(prompt, /--case selector/);
+  assert.match(prompt, /JSON runtime protocol/);
+  assert.match(result.content, /__LEETCODE_CPH_RESULT__/);
+});
+
+test('repair rejects an unchanged or incomplete-view replacement before touching the caller file', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: 'key' });
+  const existingScaffold = [
+    'import json',
+    "MARKER = '__LEETCODE_CPH_RESULT__'",
+    "selected = '--case'",
+    "TEST_NAMES = ['testcase 001', 'testcase 002']"
+  ].join('\n');
+  let calls = 0;
+  const unchanged = createAiTestcaseService({
+    secrets,
+    request: async () => {
+      calls += 1;
+      return { choices: [{ finish_reason: 'stop', message: { content: existingScaffold } }] };
+    }
+  });
+  await assert.rejects(
+    unchanged.generateScaffold({
+      metadata,
+      testCases,
+      operation: { type: 'repair', diagnostics: 'runtime failed' },
+      existingScaffold
+    }),
+    /与现有代码相同/
+  );
+  assert.equal(calls, 1);
+
+  calls = 0;
+  await assert.rejects(
+    unchanged.generateScaffold({
+      metadata,
+      testCases,
+      operation: { type: 'repair', diagnostics: 'runtime failed' },
+      existingScaffold: existingScaffold + '\n' + 'x'.repeat(35_000)
+    }),
+    /main 代码过长/
+  );
+  assert.equal(calls, 0, 'an incomplete main must never be sent for destructive replacement');
+});
+
+test('repair requires diagnostics and an existing main before making a provider request', async () => {
+  let called = false;
+  const service = createAiTestcaseService({
+    secrets: makeSecrets({ [secretKeyFor('glm')]: 'key' }),
+    request: async () => { called = true; return successfulResponse(); }
+  });
+
+  await assert.rejects(
+    service.generateScaffold({ metadata, testCases, operation: { type: 'repair' }, existingScaffold: 'main' }),
+    /需要提供 operation\.error 或 operation\.diagnostics/
+  );
+  await assert.rejects(
+    service.generateScaffold({ metadata, testCases, operation: { type: 'repair', diagnostics: 'compile failed' }, existingScaffold: '' }),
+    /必须提供现有 main 代码/
+  );
+  assert.equal(called, false);
+});
+
+test('repair diagnostics are capped and repaired output must still include every testcase and runtime protocol', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: 'key' });
+  let prompt = '';
+  const missingCase = createAiTestcaseService({
+    secrets,
+    request: async (request) => {
+      prompt = request.body.messages[1].content;
+      return {
+        choices: [{ finish_reason: 'stop', message: { content: [
+          'import json',
+          "MARKER = '__LEETCODE_CPH_RESULT__'",
+          "selected = '--case'",
+          "print('testcase 001')"
+        ].join('\n') } }]
+      };
+    }
+  });
+
+  await assert.rejects(
+    missingCase.generateScaffold({
+      metadata,
+      testCases,
+      operation: { type: 'repair', diagnostics: 'x'.repeat(MAX_REPAIR_DIAGNOSTICS_CHARS * 2) },
+      existingScaffold: '# testcase 001\n# testcase 002\n--case\n__LEETCODE_CPH_RESULT__'
+    }),
+    /缺少测试用例 “testcase 002”/
+  );
+  assert.match(prompt, /Diagnostics truncated due to length limit/);
+
+  const missingProtocol = createAiTestcaseService({
+    secrets,
+    request: async () => ({
+      choices: [{ finish_reason: 'stop', message: { content: "print('testcase 001 testcase 002')" } }]
+    })
+  });
+  await assert.rejects(
+    missingProtocol.generateScaffold({
+      metadata,
+      testCases,
+      operation: { type: 'repair', error: 'runtime failed' },
+      existingScaffold: 'print("old")'
+    }),
+    /运行结果协议/
+  );
 });
 
 test('missing key fails before any request with actionable provider-specific guidance', async () => {

@@ -97,13 +97,13 @@ async function applyCodeToMatchingTab(message) {
   try {
     focusedWindowId = (await chrome.windows.getLastFocused())?.id;
   } catch (_) { /* Fall back to tab flags only. */ }
+  const focusScore = (tab) =>
+    (tab.windowId && tab.windowId === focusedWindowId ? 2 : 0) +
+    (tab.active || tab.highlighted ? 1 : 0);
   const byRecency = (left, right) => {
     const timeDiff = (right.lastAccessed || 0) - (left.lastAccessed || 0);
     if (timeDiff) return timeDiff;
-    const score = (tab) =>
-      (tab.windowId && tab.windowId === focusedWindowId ? 2 : 0) +
-      (tab.active || tab.highlighted ? 1 : 0);
-    return score(right) - score(left);
+    return focusScore(right) - focusScore(left);
   };
 
   let tab;

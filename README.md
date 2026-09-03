@@ -2,101 +2,123 @@
 
 [简体中文](./README_zh.md)
 
-LeetCode CPH helps you move smoothly between LeetCode and VS Code: capture a problem, use your AI provider to extract its examples, manage test cases from a sidebar, run them locally, and sync your local solution back to LeetCode.
+LeetCode CPH connects a browser extension with a VS Code extension so you can capture a LeetCode problem, manage and run test cases locally, and sync your solution back to the open problem page.
 
 ## Features
 
-- Capture the current LeetCode editor code as one readable, title-named file such as `1. Two Sum.py` in your VS Code workspace.
-- Configure a GLM, DeepSeek, or Qwen API key. After capture, the selected AI extracts only explicit examples grounded in the captured problem text; without a configured key, no automatic test cases or scaffold are created.
-- View and edit multiple test cases in the **LeetCode CPH** sidebar on the left side of VS Code. Cases are named `testcase 001`, `testcase 002`, and so on.
-- Add a blank case with **+新增测试用例**, then fill in its input and expected output directly in the card.
-- Keep the problem metadata, editable test cases, AI-generated scaffold, runtime copy, and backups in VS Code's workspace-private extension storage instead of cluttering the project folder.
-- Automatically generate a private test scaffold after a successful AI extraction. Adding, editing, or deleting a case automatically updates that scaffold while the add button and all delete buttons are temporarily locked.
-- Run one test case or all test cases from the sidebar, and compare each expected output with the actual output. Local execution currently supports Python and JavaScript scaffolds.
-- Sync the current local solution to an open LeetCode problem page from the sidebar.
-- Open the GitHub issue repository directly from the sidebar.
+- Capture the current LeetCode problem and editor code into a title-named folder in your workspace:
+
+  ```text
+  <output directory>/<problem title>/
+    solution.<ext>
+    main.<ext>
+  ```
+
+  `solution.<ext>` is your answer. `main.<ext>` is the AI-generated local test entry point and is created only after AI generation succeeds.
+- Configure GLM, DeepSeek, or Qwen. API keys are saved in VS Code's secure Secret Storage.
+- Use the configured AI to extract test cases from the captured problem. Without an API key, the extension does not automatically extract or generate any test cases.
+- View, add, edit, and delete cases such as `testcase 001` and `testcase 002` in the Chinese VS Code sidebar UI.
+- Automatically update `main.<ext>` whenever a registered test case is added, edited, or deleted. Test-case editing controls are locked while AI extraction or scaffold generation is in progress.
+- Run one case or all cases from the sidebar. Each result shows expected and actual output; differing output lines are highlighted in yellow.
+- Sync the current `solution.<ext>` code to the matching open LeetCode page with the sidebar button. The former Command Palette sync command is no longer used.
+- Open the project's GitHub issue page from the sidebar.
+
+Problem metadata, editable test-case data, and overwrite backups are kept in VS Code's private workspace storage. They are not added to your project folder.
 
 ## Installation
 
-### 1. Install the Edge extension
+LeetCode CPH requires both the browser extension and the VS Code extension.
 
-1. Open `edge://extensions` in Edge.
-2. Turn on **Developer mode**.
-3. Select **Load unpacked** and choose this repository's [`edge-extension`](./edge-extension) folder.
+### Install the Edge extension
 
-### 2. Install the VS Code extension
+1. Open `edge://extensions` in Microsoft Edge.
+2. Enable **Developer mode**.
+3. Select **Load unpacked**.
+4. Choose this repository's [`edge-extension`](./edge-extension) folder.
 
-If you already have a VSIX file:
+If you use an InPrivate window, open the extension details and enable **Allow in InPrivate**.
+
+### Install the VS Code extension
+
+If you already have a `.vsix` package:
 
 1. Open the **Extensions** view in VS Code.
-2. Select `...` in the upper-right corner and choose **Install from VSIX...**.
-3. Choose the `leetcode-cph-receiver-*.vsix` file.
-4. Run **Developer: Reload Window** after installation.
+2. Select `...` and then **Install from VSIX...**.
+3. Choose `leetcode-cph-receiver-0.6.1.vsix` (or the newer package you built).
+4. Reload VS Code after installation.
 
-To create a VSIX from source, run this from the repository root:
+You can also install it from a terminal:
+
+```powershell
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.6.1.vsix
+```
+
+To build the VSIX from source, run:
 
 ```powershell
 Set-Location .\vscode-extension
 npx --yes @vscode/vsce@latest package --no-dependencies
 ```
 
-The generated VSIX is placed in `vscode-extension`. You can also install it through the VS Code command-line tool:
+The generated `.vsix` file is placed in the `vscode-extension` folder.
 
-```powershell
-code --install-extension .\leetcode-cph-receiver-<version>.vsix
-```
+## Usage
 
-Replace `<version>` with the generated version number, then reload VS Code.
+### 1. Capture a problem
 
-## How to use it
+1. Open a workspace in VS Code.
+2. Open a LeetCode problem in Edge and select the desired editor language.
+3. Click the **LeetCode CPH Capture** browser-extension icon.
+4. The extension creates `<output directory>/<problem title>/solution.<ext>` and opens it in VS Code. The default output directory is `leetcode` and can be changed in VS Code settings.
 
-### Capture a problem
+If an AI key is configured, example extraction and `main.<ext>` generation continue in the background. While either job is running, test cases cannot be added, edited, or deleted.
 
-1. Open your practice workspace in VS Code.
-2. Open a LeetCode problem in Edge and select the language you want in the web editor.
-3. Click the **LeetCode CPH Capture** icon in the Edge toolbar.
-4. VS Code immediately saves the browser code as `<problem title>.<language extension>` and opens that file. Problem context and test data are stored privately. If an AI key is configured, example extraction and scaffold generation continue in the background; they do not delay the capture. Without a key, capture still saves the solution but creates no automatic cases or scaffold.
+Capturing the same registered problem title again replaces its recorded solution and test entry files. Previous registered files are backed up in private extension storage before replacement. Unsaved editors are not overwritten; save or close them and capture again.
 
-Re-capturing the same language refreshes the registered title-named file with the current browser code. If the saved local file differs, its previous contents are backed up in private extension storage. An unsaved local editor is never overwritten: save or close it before capturing again.
+### 2. Configure AI and manage test cases
 
-If two registered problems have the same title and language extension, the latest capture intentionally overwrites the shared title-named solution and replaces its active private record; no `(slug)` filename is created. The displaced record is retained only in the extension's private overwrite backup area.
+1. Open the **LeetCode CPH** view in the VS Code Activity Bar.
+2. Select **配置 AI**, choose GLM, DeepSeek, or Qwen, and enter an API key.
+3. Capture the problem. The selected AI extracts grounded examples and creates `main.<ext>` beside `solution.<ext>`.
+4. Use **+新增测试用例** to create a blank case, edit its input and expected output, or delete an existing case. Each change asks the selected AI to update `main.<ext>`.
 
-### Manage test cases and generate tests
+If no key is configured, capture still saves the problem and solution, but no cases or `main.<ext>` are generated automatically.
 
-1. Open the title-named solution file created by LeetCode CPH.
-2. Click the **LeetCode CPH** icon in the VS Code Activity Bar.
-3. On first use, click **配置 AI** (Configure AI), choose GLM, DeepSeek, or Qwen, and enter an API key.
-4. Capture the problem after the key is configured. AI extracts explicit examples from the saved problem context and automatically creates or refreshes the scaffold. Capture the problem again to retry a failed extraction or scaffold update.
-5. Review or edit the case cards. Click **+新增测试用例** to add a blank card, then fill in its input and expected output. Click **保存并更新** to save the card and update the scaffold.
-6. Use **运行** on a card or **运行全部测试用例** after the scaffold is generated. At run time the extension combines the saved visible solution with its private scaffold. The card shows the actual output and a clear expected/actual difference when they do not match.
+### 3. Run tests
 
-Adding, editing, or deleting a test case automatically updates the test scaffold. During that update, the add button and every delete button are disabled. Save any manual changes to the scaffold before using those actions. You can still save a manual case before configuring a key, but the scaffold remains pending until you configure an AI provider and capture the problem again.
+- Select **运行** on a case to run only that case.
+- Select **运行全部测试用例** to run all cases.
+- Review expected and actual output in each card. Lines that differ are highlighted in yellow.
 
-### Sync code to LeetCode
+The generated `main.<ext>` is executable code. Run it only in a trusted workspace and inspect it before approval when prompted.
 
-1. Keep the matching LeetCode problem page open.
-2. Make sure its editor language matches the open local solution file.
-3. Click **同步代码到 LeetCode** (Sync Code to LeetCode) in the sidebar.
+If a generated `main.<ext>` fails with a repairable compile, runtime, or result-protocol error while the AI key is still configured, the extension asks the selected AI to repair it using the current solution, existing `main.<ext>`, all test cases, and sanitized, size-limited diagnostics. The replacement is validated and the previous `main.<ext>` is backed up. Tests are not rerun silently: review the updated file, then run them again yourself. A missing local compiler or runtime is a toolchain setup issue and does not trigger AI repair.
 
-The button uses the code currently open in VS Code, including unsaved edits. The former Command Palette sync command is no longer used.
+### 4. Sync to LeetCode
 
-## AI and data notes
+1. Keep the matching LeetCode problem page open in Edge.
+2. Make sure the browser editor language matches `solution.<ext>`.
+3. Select **同步代码到 LeetCode** in the sidebar.
 
-- API keys are stored securely by VS Code and are not written to workspace files.
-- Extracting examples sends the captured problem statement and example text to the AI provider you select. Generating or updating a scaffold also sends the current solution and testcase data. Please use the provider according to its terms and pricing.
-- Re-capturing a problem saves the browser snapshot first, then re-extracts examples and refreshes a changed scaffold in the background. Previous saved solution and scaffold contents are backed up in private extension storage before replacement.
-- Private problem/test state belongs to this VS Code workspace and is not committed to Git. Clearing VS Code workspace storage or uninstalling extension data can remove it; the visible title-named solution file remains in your workspace.
-- A generated scaffold is executable local code. Run tests only in a trusted workspace; on the first run after generated code changes, use **查看测试代码** in the confirmation dialog if you want to inspect the private scaffold before approving it. Local execution uses your account's local permissions; it is not a sandbox.
+The current editor contents, including unsaved changes, are sent to the matching page.
 
-## Troubleshooting
+## Supported local languages
 
-- If syncing fails, check that the Edge extension is enabled, the problem page is still open, and the browser language matches the local solution language.
-- For an Edge InPrivate window, enable **Allow in InPrivate** in the extension details first.
-- Folders created by versions before 0.5 are copied into private storage when that problem is captured again, but are not deleted automatically. After verifying the new title-named file and sidebar cases, you may archive the old folder yourself.
+Local test execution supports:
+
+- C, C++, C#, Rust, Go, Haskell
+- Python, Ruby, Java, JavaScript, TypeScript
+- Kotlin, Swift, PHP, Scala
+
+The required compiler or runtime must be installed locally and available through `PATH`. SQL test execution is not supported.
+
+## Unlinked local solutions
+
+If a workspace already contains `solution.<ext>` but the extension cannot find its private problem record and source URL, the file is treated as an unlinked local solution. You may manually add, edit, and delete test cases, but AI extraction, `main.<ext>` generation, local execution, and browser sync are disabled because the problem cannot be matched safely.
 
 ## Feedback
 
-Use **反馈 Bug** (Report Bug) in the sidebar, or open the [GitHub repository](https://github.com/dd1000001000/simple-leetcode-cph) directly.
+Use **反馈 Bug** in the sidebar or visit the [GitHub repository](https://github.com/dd1000001000/simple-leetcode-cph).
 
 ## License
 

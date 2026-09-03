@@ -23,8 +23,8 @@ function loadExtension(vscodeStub, dependencyOverrides = {}) {
     Buffer,
     URL,
     process,
-    setTimeout,
-    clearTimeout,
+    setTimeout: dependencyOverrides.setTimeout || setTimeout,
+    clearTimeout: dependencyOverrides.clearTimeout || clearTimeout,
     setInterval,
     clearInterval,
     require: (name) => {
@@ -37,7 +37,7 @@ function loadExtension(vscodeStub, dependencyOverrides = {}) {
       if (name === './sidebar-provider') return require('../vscode-extension/sidebar-provider');
       if (name === './testcase-store') return require('../vscode-extension/testcase-store');
       if (name === './ai-testcase-service') return require('../vscode-extension/ai-testcase-service');
-      if (name === './testcase-runner') return require('../vscode-extension/testcase-runner');
+      if (name === './testcase-runner') return dependencyOverrides.testcaseRunner || require('../vscode-extension/testcase-runner');
       throw new Error(`Unexpected require: ${name}`);
     }
   };
@@ -50,6 +50,47 @@ function initializePrivateStorage(sandbox, storagePath) {
   const initialized = sandbox.initializeExtensionStorage({ storageUri: { fsPath: storagePath } });
   assert.equal(initialized, path.resolve(storagePath));
 }
+
+test('sidebar notice expires after 15 seconds and stale dismissal cannot clear a newer notice', () => {
+  const timers = [];
+  const cleared = [];
+  const sandbox = loadExtension(
+    { workspace: { textDocuments: [] }, window: {} },
+    {
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { if (timer) cleared.push(timer); }
+    }
+  );
+  sandbox.setSidebarRuntime({ notice: '第一条通知' });
+  const first = sandbox.runtimeStateFor(null);
+  assert.equal(first.notice, '第一条通知');
+  assert.ok(Number.isSafeInteger(first.noticeRevision));
+  assert.equal(timers.at(-1).delay, 15_000);
+
+  sandbox.setSidebarRuntime({ notice: '第二条通知' });
+  const second = sandbox.runtimeStateFor(null);
+  assert.ok(second.noticeRevision > first.noticeRevision);
+  assert.ok(cleared.includes(timers[0]));
+  sandbox.dismissSidebarNotice(first.noticeRevision);
+  assert.equal(sandbox.runtimeStateFor(null).notice, '第二条通知');
+  timers[0].callback();
+  assert.equal(sandbox.runtimeStateFor(null).notice, '第二条通知', 'an already queued old timer must not dismiss a newer notice');
+  sandbox.dismissSidebarNotice(second.noticeRevision);
+  assert.equal(sandbox.runtimeStateFor(null).notice, '');
+  assert.ok(cleared.includes(timers[1]), 'a stale callback must not lose ownership of the current timer');
+
+  sandbox.setSidebarRuntime({ notice: '第三条通知' });
+  const third = sandbox.runtimeStateFor(null);
+  assert.equal(third.notice, '第三条通知');
+  timers.at(-1).callback();
+  const dismissed = sandbox.runtimeStateFor(null);
+  assert.equal(dismissed.notice, '');
+  assert.ok(dismissed.noticeRevision > third.noticeRevision);
+});
 
 test('sidebar keeps the problem context when testcase.* is active and uses an unsaved solution buffer', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-sidebar-context-'));
@@ -215,14 +256,16 @@ test('capture accepts only LeetCode problem URLs', () => {
   assert.equal(sandbox.validPayload({
     title: 'Wrong protocol', source: 'http://leetcode.com/problems/two-sum/', code: ''
   }), false);
+  assert.equal(sandbox.languageExtension('Haskell'), 'hs');
 });
 
-test('capture exposes only a title-named solution and keeps state, scaffold, and backups private', async () => {
+test('capture creates a title-named problem directory with solution and main while state stays private', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-recapture-workspace-'));
   const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-recapture-storage-'));
   temporaryFolders.push(root, storage);
   const outputFolder = path.join(root, 'leetcode');
-  const solutionPath = path.join(outputFolder, '1. Two Sum.py');
+  const problemDirectory = path.join(outputFolder, '1. Two Sum');
+  const solutionPath = path.join(problemDirectory, 'solution.py');
   const textDocuments = [];
   const vscodeStub = {
     workspace: {
@@ -249,7 +292,7 @@ test('capture exposes only a title-named solution and keeps state, scaffold, and
   assert.equal(first.problemFolder.startsWith(path.join(storage, 'problems')), true);
   assert.notEqual(first.problemFolder, path.dirname(solutionPath));
 
-  const scaffoldPath = path.join(first.problemFolder, 'testcase.py');
+  const scaffoldPath = path.join(problemDirectory, 'main.py');
   await fs.writeFile(scaffoldPath, '# scaffold for the old solution\n', 'utf8');
   textDocuments.push({
     uri: { scheme: 'file', fsPath: solutionPath },
@@ -263,18 +306,20 @@ test('capture exposes only a title-named solution and keeps state, scaffold, and
   assert.equal(saved.scaffoldStale, true);
   assert.equal(await fs.readFile(solutionPath, 'utf8'), 'browser_code = True\n');
   assert.equal(await fs.readFile(saved.solutionBackup, 'utf8'), 'disk_solution = True\n');
-  assert.deepEqual(await fs.readdir(outputFolder), ['1. Two Sum.py']);
+  assert.deepEqual(await fs.readdir(outputFolder), ['1. Two Sum']);
+  assert.deepEqual((await fs.readdir(problemDirectory)).sort(), ['main.py', 'solution.py']);
 
   const privateEntries = (await fs.readdir(saved.problemFolder)).sort();
-  assert.deepEqual(privateEntries, ['metadata.json', 'solution.py.bak', 'testcase.py', 'testcases.json']);
+  assert.deepEqual(privateEntries, ['metadata.json', 'solution.py.bak', 'testcases.json']);
   const metadata = JSON.parse(await fs.readFile(path.join(saved.problemFolder, 'metadata.json'), 'utf8'));
   assert.equal(metadata.code, 'browser_code = True\n');
   assert.equal(metadata.solutionPath, solutionPath);
-  assert.equal(metadata.solutionFileName, '1. Two Sum.py');
+  assert.equal(metadata.solutionFileName, 'solution.py');
+  assert.equal(metadata.mainFileName, 'main.py');
   assert.equal(metadata.testcaseScaffoldStale, true);
 
   // A new extension-host instance has an empty in-memory cache, so this proves
-  // the title-named visible file can be resolved by scanning private metadata.
+  // the visible solution can be resolved by scanning private metadata.
   const reloadedVscodeStub = {
     workspace: {
       workspaceFolders: [{ uri: { fsPath: root } }],
@@ -297,7 +342,7 @@ test('capture exposes only a title-named solution and keeps state, scaffold, and
   assert.equal(context.code, 'browser_code = True\n');
 });
 
-test('running all cases combines the visible title file with the private scaffold', async () => {
+test('running all cases executes the sibling visible solution and main files', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-hidden-run-workspace-'));
   const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-hidden-run-storage-'));
   temporaryFolders.push(root, storage);
@@ -332,7 +377,7 @@ test('running all cases combines the visible title file with the private scaffol
   await fs.writeFile(path.join(saved.problemFolder, 'testcases.json'), JSON.stringify({
     version: 3, testCases: [testCase], excludedAiIds: [], excludedLeetCodeIds: []
   }), 'utf8');
-  await fs.writeFile(path.join(saved.problemFolder, 'testcase.js'), [
+  await fs.writeFile(path.join(path.dirname(saved.solution), 'main.js'), [
     "const add = require('./solution');",
     "const selected = process.argv[2] === '--case' ? process.argv[3] : '';",
     "if (!selected || selected === 'testcase 001') {",
@@ -354,8 +399,10 @@ test('running all cases combines the visible title file with the private scaffol
 
   assert.equal(result.execution.ok, true);
   assert.equal(result.execution.results['testcase 001'].actual, 3);
-  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'solution.js'), 'utf8'), solutionDocument.getText());
-  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['1. Add.js']);
+  await assert.rejects(fs.access(path.join(saved.problemFolder, 'solution.js')), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(saved.solution, 'utf8'), solutionDocument.getText());
+  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['1. Add']);
+  assert.deepEqual((await fs.readdir(path.dirname(saved.solution))).sort(), ['main.js', 'solution.js']);
 });
 
 test('same-title captures overwrite the registered file and active record instead of creating a suffix', async () => {
@@ -382,7 +429,7 @@ test('same-title captures overwrite the registered file and active record instea
   });
   assert.equal(second.solution, first.solution);
   assert.equal(await fs.readFile(second.solution, 'utf8'), 'beta = 1\n');
-  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['Same Name.py']);
+  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['Same Name']);
   const betaMetadata = JSON.parse(await fs.readFile(path.join(second.problemFolder, 'metadata.json'), 'utf8'));
   assert.equal(betaMetadata.source, 'https://leetcode.com/problems/beta-problem/');
   assert.equal(second.solutionBackup, '');
@@ -406,14 +453,14 @@ test('same-title captures overwrite the registered file and active record instea
     ...common, source: 'https://leetcode.cn/problems/alpha-problem/', problemSlug: 'alpha-problem', code: 'alpha = 2\n'
   });
 
-  assert.equal(path.basename(first.solution), 'Same Name.py');
+  assert.equal(path.basename(first.solution), 'solution.py');
   assert.equal(recaptured.solution, first.solution);
   assert.equal(recaptured.problemFolder, first.problemFolder);
   assert.notEqual(second.problemFolder, first.problemFolder);
   assert.equal(await fs.readFile(first.solution, 'utf8'), 'alpha = 2\n');
   const alphaMetadata = JSON.parse(await fs.readFile(path.join(recaptured.problemFolder, 'metadata.json'), 'utf8'));
   assert.equal(alphaMetadata.source, 'https://leetcode.cn/problems/alpha-problem/');
-  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['Same Name.py']);
+  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['Same Name']);
   assert.equal((await fs.readdir(path.join(storage, 'overwritten'))).length, 2);
   assert.deepEqual(await fs.readdir(path.join(storage, 'problems')), [path.basename(recaptured.problemFolder)]);
 });
@@ -569,7 +616,8 @@ test('capturing a legacy problem copies its generated state privately without de
 
   assert.equal(await fs.readFile(saved.solution, 'utf8'), 'browser = True\n');
   assert.equal(await fs.readFile(path.join(saved.problemFolder, 'solution.py.legacy.bak'), 'utf8'), 'old_local = True\n');
-  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'testcase.py'), 'utf8'), '# old private scaffold\n');
+  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'main.py.legacy.bak'), 'utf8'), '# old private scaffold\n');
+  await assert.rejects(fs.access(path.join(path.dirname(saved.solution), 'main.py')), { code: 'ENOENT' });
   const migratedCases = JSON.parse(await fs.readFile(path.join(saved.problemFolder, 'testcases.json'), 'utf8'));
   assert.equal(migratedCases.testCases[0].id, legacyCase.id);
   assert.equal(saved.scaffoldStale, true);
@@ -637,7 +685,7 @@ test('private records stay bound to their original workspace root when multi-roo
     title: 'Two Sum', source: 'https://leetcode.com/problems/two-sum/', problemSlug: 'two-sum',
     language: 'Python3', description: '', samples: '', code: 'from_root_a = True\n'
   });
-  const sameRelativePathInB = path.join(rootB, 'leetcode', 'Two Sum.py');
+  const sameRelativePathInB = path.join(rootB, 'leetcode', 'Two Sum', 'solution.py');
   await fs.mkdir(path.dirname(sameRelativePathInB), { recursive: true });
   await fs.writeFile(sameRelativePathInB, 'from_root_b = True\n', 'utf8');
 
@@ -646,7 +694,10 @@ test('private records stay bound to their original workspace root when multi-roo
   vscodeStub.window.activeTextEditor = {
     document: { uri: { scheme: 'file', fsPath: sameRelativePathInB }, getText: () => 'from_root_b = True\n' }
   };
-  await assert.rejects(sandbox.activeProblemContext(), /不是由 LeetCode CPH 登记/);
+  const localContext = await sandbox.activeProblemContext();
+  assert.equal(localContext.localOnly, true);
+  assert.equal(localContext.source, '');
+  assert.notEqual(localContext.folder, saved.problemFolder);
 
   vscodeStub.window.activeTextEditor = {
     document: { uri: { scheme: 'file', fsPath: saved.solution }, getText: () => 'from_root_a = True\n' }
@@ -791,14 +842,32 @@ test('background AI generation follows a solution rename recorded after capture'
   assert.equal(processed.scaffoldGenerated, true);
   assert.equal(generationMetadata.solutionFileName, 'My Two Sum.py');
   assert.equal(generationCode, payload.code);
-  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'testcase.py'), 'utf8'), '# generated after rename\n');
+  const mainPath = path.join(path.dirname(renamedSolution), 'main.py');
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# generated after rename\n');
+
+  // A fresh extension host has no cache. Opening main must still resolve the
+  // metadata-recorded, individually renamed solution rather than assuming a
+  // sibling file literally named solution.py.
+  const reloaded = loadExtension({
+    workspace: {
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: () => undefined })
+    },
+    window: {
+      activeTextEditor: { document: { uri: { scheme: 'file', fsPath: mainPath }, getText: () => '# generated after rename\n' } }
+    }
+  });
+  initializePrivateStorage(reloaded, storage);
+  const reloadedContext = await reloaded.activeProblemContext();
+  assert.equal(reloadedContext.solutionPath, renamedSolution);
+  assert.equal(reloadedContext.folder, saved.problemFolder);
 });
 
 test('re-capturing rejects a dirty local solution without changing any file', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-dirty-workspace-'));
   const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-dirty-storage-'));
   temporaryFolders.push(root, storage);
-  const solutionPath = path.join(root, 'leetcode', '1. Two Sum.py');
+  const solutionPath = path.join(root, 'leetcode', '1. Two Sum', 'solution.py');
   const originalSolution = 'disk_solution = True\n';
   const textDocuments = [];
   const vscodeStub = {
@@ -836,14 +905,14 @@ test('re-capturing rejects a dirty local solution without changing any file', as
   assert.equal(await fs.readFile(metadataPath, 'utf8'), originalMetadata);
   assert.equal(await fs.readFile(path.join(initial.problemFolder, 'testcases.json'), 'utf8'), originalTestCases);
   await assert.rejects(fs.access(path.join(initial.problemFolder, 'solution.py.bak')), { code: 'ENOENT' });
-  assert.deepEqual(await fs.readdir(path.dirname(solutionPath)), ['1. Two Sum.py']);
+  assert.deepEqual(await fs.readdir(path.dirname(solutionPath)), ['solution.py']);
 });
 
 test('AI scaffold replacement preserves the prior saved scaffold as a backup', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-scaffold-backup-'));
   temporaryFolders.push(folder);
   const solutionPath = path.join(folder, 'solution.py');
-  const scaffoldPath = path.join(folder, 'testcase.py');
+  const scaffoldPath = path.join(folder, 'main.py');
   const oldScaffold = "# manually adjusted scaffold\nprint('old')\n";
   const newScaffold = "# generated scaffold\nprint('new')\n";
   await Promise.all([
@@ -885,6 +954,45 @@ test('AI scaffold replacement preserves the prior saved scaffold as a backup', a
   assert.equal(metadata.testcaseScaffoldStale, false);
 });
 
+test('AI generation never overwrites main when it changes while the model request is in flight', async () => {
+  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-main-race-'));
+  temporaryFolders.push(folder);
+  const solutionPath = path.join(folder, 'solution.py');
+  const mainPath = path.join(folder, 'main.py');
+  await Promise.all([
+    fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
+    fs.writeFile(mainPath, '# old main\n', 'utf8'),
+    fs.writeFile(path.join(folder, 'metadata.json'), JSON.stringify({
+      title: 'Race', source: 'https://leetcode.com/problems/race/', language: 'Python3', testcaseScaffoldStale: true
+    }), 'utf8')
+  ]);
+  const sandbox = loadExtension({
+    workspace: {
+      isTrusted: true,
+      textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: {}
+  });
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async generateScaffold() {
+      await fs.writeFile(mainPath, '# newer local main\n', 'utf8');
+      return { content: '# stale AI response\n', provider: 'glm', model: 'glm-5.2' };
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+
+  await assert.rejects(sandbox.generateTestScaffold({
+    folder,
+    solutionPath,
+    code: 'class Solution: pass\n',
+    metadata: { title: 'Race', source: 'https://leetcode.com/problems/race/', language: 'Python3', testcaseScaffoldStale: true }
+  }, [{ id: 'one', name: 'testcase 001', input: '1', expectedOutput: '1', source: 'manual' }], { type: 'update' }), /main\.py 已发生变化/);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# newer local main\n');
+  await assert.rejects(fs.access(path.join(folder, 'main.py.bak')), { code: 'ENOENT' });
+});
+
 test('a manual blank case is saved without an API key and leaves the scaffold pending', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-manual-no-key-'));
   temporaryFolders.push(folder);
@@ -924,6 +1032,204 @@ test('a manual blank case is saved without an API key and leaves the scaffold pe
   assert.match(metadata.testcaseScaffoldError, /未配置 GLM API Key/);
 });
 
+test('an unlinked solution supports manual cases but never AI, execution, or URL-less sync', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-local-only-workspace-'));
+  const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-local-only-storage-'));
+  temporaryFolders.push(root, storage);
+  const problemDirectory = path.join(root, 'leetcode', 'Local Problem');
+  const solutionPath = path.join(problemDirectory, 'solution.py');
+  await fs.mkdir(problemDirectory, { recursive: true });
+  await fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8');
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }],
+      rootPath: root,
+      textDocuments: [],
+      getConfiguration: () => ({ get: () => undefined })
+    },
+    window: {
+      activeTextEditor: {
+        document: { uri: { scheme: 'file', fsPath: solutionPath }, getText: () => 'class Solution: pass\n' }
+      },
+      setStatusBarMessage() {}
+    }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  initializePrivateStorage(sandbox, storage);
+  vm.runInContext('outputChannel = { appendLine() {} };', sandbox);
+
+  const initial = await sandbox.activeProblemContext();
+  assert.equal(initial.localOnly, true);
+  assert.equal(initial.source, '');
+  const state = await sandbox.sidebarState();
+  assert.equal(state.problem.localOnly, true);
+  assert.equal(state.problem.canSync, false);
+  assert.equal(state.problem.scaffoldReady, false);
+
+  const added = await sandbox.mutateTestCaseAndScaffold('add', {});
+  assert.equal(added.localOnly, true);
+  assert.equal(added.testCase.input, '');
+  const updated = await sandbox.mutateTestCaseAndScaffold('update', {
+    id: added.testCase.id,
+    input: 'x = 1',
+    expectedOutput: '1'
+  });
+  assert.equal(updated.testCase.input, 'x = 1');
+  const deleted = await sandbox.mutateTestCaseAndScaffold('delete', { id: added.testCase.id });
+  assert.equal(deleted.testCases.length, 0);
+
+  let browserApplyCalls = 0;
+  sandbox.requestBrowserApply = async () => { browserApplyCalls += 1; return {}; };
+  await assert.rejects(sandbox.syncActiveSolution(), /没有对应的 LeetCode URL/);
+  assert.equal(browserApplyCalls, 0);
+  await assert.rejects(sandbox.runTestsFromSidebar('all'), /没有私有题目信息/);
+  await assert.rejects(sandbox.extractTestCasesForContext(initial), /不能使用 AI/);
+  await assert.rejects(sandbox.generateTestScaffold(initial, [], { type: 'initialize' }), /不能生成 main/);
+  await assert.rejects(fs.access(path.join(problemDirectory, 'main.py')), { code: 'ENOENT' });
+});
+
+test('a repairable main failure sends diagnostics and existing code to AI, then replaces main with a backup', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-main-repair-workspace-'));
+  const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-main-repair-storage-'));
+  temporaryFolders.push(root, storage);
+  const runner = require('../vscode-extension/testcase-runner');
+  const compileFailure = Object.assign(new Error('main 编译失败'), {
+    code: 'COMPILE_FAILED',
+    exitCode: 1,
+    stdout: '',
+    stderr: 'main.py:7: invalid syntax'
+  });
+  let runnerMode = 'compile';
+  let runtimeMainPath = '';
+  const textDocuments = [];
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }],
+      rootPath: root,
+      textDocuments,
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: {
+      showTextDocument: async () => {},
+      showWarningMessage: async () => '我已审阅，运行'
+    },
+    Uri: { file: (value) => ({ scheme: 'file', fsPath: value }) }
+  };
+  const sandbox = loadExtension(vscodeStub, {
+    testcaseRunner: {
+      ...runner,
+      runAllTestCases: async () => {
+        if (runnerMode === 'compile') throw compileFailure;
+        if (runnerMode === 'race') {
+          await fs.writeFile(runtimeMainPath, '# user saved a newer main after execution started\n', 'utf8');
+        }
+        const protocolLine = '__LEETCODE_CPH_RESULT__' + JSON.stringify({
+          name: 'testcase 001', actual: null, error: 'TypeError: adapter invocation failed'
+        });
+        return {
+          ok: true,
+          results: {
+            'testcase 001': { name: 'testcase 001', actual: null, error: 'TypeError: adapter invocation failed' }
+          },
+          stdout: protocolLine + '\n',
+          stderr: 'adapter stack trace',
+          exitCode: 0,
+          signal: null
+        };
+      }
+    }
+  });
+  initializePrivateStorage(sandbox, storage);
+  vm.runInContext('outputChannel = { appendLine() {} };', sandbox);
+  const saved = await sandbox.saveCapture({
+    title: 'Repair Me', source: 'https://leetcode.com/problems/repair-me/', problemSlug: 'repair-me',
+    language: 'Python3', description: '', samples: '', code: 'class Solution: pass\n'
+  });
+  const oldMain = "# broken main\nprint('__LEETCODE_CPH_RESULT__')\n";
+  const fixedMain = "# fixed main\nprint('__LEETCODE_CPH_RESULT__' + '{\"name\":\"testcase 001\",\"actual\":1,\"passed\":true}')\n";
+  runtimeMainPath = path.join(path.dirname(saved.solution), 'main.py');
+  await fs.writeFile(runtimeMainPath, oldMain, 'utf8');
+  await fs.writeFile(path.join(saved.problemFolder, 'testcases.json'), JSON.stringify({
+    version: 3,
+    testCases: [{
+      id: 'manual-1', name: 'testcase 001', input: 'x = 1', expectedOutput: '1',
+      source: 'manual', createdAt: '2026-09-02T00:00:00.000Z'
+    }],
+    excludedAiIds: [], excludedLeetCodeIds: []
+  }), 'utf8');
+  const metadataPath = path.join(saved.problemFolder, 'metadata.json');
+  const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  await fs.writeFile(metadataPath, JSON.stringify({
+    ...metadata,
+    testcaseScaffoldStale: false,
+    testcaseExtraction: { status: 'extracted' }
+  }), 'utf8');
+  const solutionDocument = {
+    uri: { scheme: 'file', fsPath: saved.solution },
+    isDirty: false,
+    getText: () => 'class Solution: pass\n'
+  };
+  textDocuments.push(solutionDocument);
+  vscodeStub.window.activeTextEditor = { document: solutionDocument };
+
+  let repairRequest;
+  let repairCalls = 0;
+  let aiMode = 'success';
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async generateScaffold(request) {
+      repairCalls += 1;
+      repairRequest = request;
+      if (aiMode === 'failure') throw new Error('provider unavailable');
+      return { content: fixedMain, provider: 'glm', model: 'glm-5.2' };
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService;', sandbox);
+
+  const result = await sandbox.runTestsFromSidebar('all');
+
+  assert.equal(result.execution, null);
+  assert.equal(result.repair.repaired, true);
+  assert.equal(repairRequest.operation.type, 'repair');
+  assert.equal(repairRequest.operation.diagnostics.code, 'COMPILE_FAILED');
+  assert.match(repairRequest.operation.diagnostics.stderr, /invalid syntax/);
+  assert.equal(repairRequest.existingScaffold, oldMain);
+  assert.equal(await fs.readFile(path.join(path.dirname(saved.solution), 'main.py'), 'utf8'), fixedMain);
+  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'main.py.bak'), 'utf8'), oldMain);
+  assert.equal((await sandbox.sidebarState()).problem.aiBusy, false);
+
+  runnerMode = 'protocol';
+  repairRequest = null;
+  const protocolResult = await sandbox.runTestsFromSidebar('all');
+  assert.equal(protocolResult.execution.ok, true);
+  assert.equal(protocolResult.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
+  assert.equal(protocolResult.repair.repaired, true);
+  assert.equal(repairRequest.operation.type, 'repair');
+  assert.equal(repairRequest.operation.diagnostics.code, 'CASE_RUNTIME_ERROR');
+  assert.match(repairRequest.operation.diagnostics.message, /adapter invocation failed/);
+  assert.match(repairRequest.operation.diagnostics.stderr, /adapter stack trace/);
+  assert.equal(repairRequest.existingScaffold, fixedMain);
+
+  aiMode = 'failure';
+  const failedRepair = await sandbox.runTestsFromSidebar('all');
+  assert.equal(failedRepair.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
+  assert.equal(failedRepair.repair, null);
+  assert.match(failedRepair.repairError.message, /provider unavailable/);
+  assert.equal(await fs.readFile(runtimeMainPath, 'utf8'), fixedMain);
+
+  aiMode = 'success';
+  runnerMode = 'race';
+  const repairCallsBeforeRace = repairCalls;
+  const staleFailure = await sandbox.runTestsFromSidebar('all');
+  assert.equal(staleFailure.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
+  assert.equal(staleFailure.repair, null);
+  assert.match(staleFailure.repairError.message, /main 已发生变化/);
+  assert.equal(repairCalls, repairCallsBeforeRace, 'a newer main must not be sent to AI with stale diagnostics');
+  assert.equal(await fs.readFile(runtimeMainPath, 'utf8'), '# user saved a newer main after execution started\n');
+});
+
 test('capture defers remote AI extraction and scaffold generation until processCapturedAi', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-manual-workspace-'));
   const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-manual-storage-'));
@@ -959,8 +1265,8 @@ test('capture defers remote AI extraction and scaffold generation until processC
   assert.equal(generated, 0, 'saveCapture must not generate a scaffold');
   assert.equal(saved.problemFolder.startsWith(path.join(storage, 'problems')), true);
   assert.notEqual(saved.problemFolder, path.dirname(saved.solution));
-  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['1. Two Sum.py']);
-  await assert.rejects(fs.access(path.join(saved.problemFolder, 'testcase.py')), { code: 'ENOENT' });
+  assert.deepEqual(await fs.readdir(path.join(root, 'leetcode')), ['1. Two Sum']);
+  await assert.rejects(fs.access(path.join(saved.problemFolder, 'main.py')), { code: 'ENOENT' });
   vscodeStub.window.activeTextEditor = {
     document: { uri: { scheme: 'file', fsPath: saved.solution }, getText: () => 'browser_code = True\n' }
   };
@@ -969,7 +1275,7 @@ test('capture defers remote AI extraction and scaffold generation until processC
   assert.equal(interruptedState.problem.scaffoldReady, false);
 
   // Simulate a manual case already persisted in the private store. An empty
-  // extraction must still generate its scaffold in that same private folder.
+  // extraction must still generate its sibling visible main file.
   await fs.writeFile(path.join(saved.problemFolder, 'testcases.json'), JSON.stringify({
     version: 3,
     testCases: [{
@@ -987,6 +1293,6 @@ test('capture defers remote AI extraction and scaffold generation until processC
   assert.equal(processed.scaffoldGenerated, true);
   assert.equal(extracted, 1);
   assert.equal(generated, 1);
-  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'testcase.py'), 'utf8'), '# generated manual scaffold\n');
-  await assert.rejects(fs.access(path.join(path.dirname(saved.solution), 'testcase.py')), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(path.join(path.dirname(saved.solution), 'main.py'), 'utf8'), '# generated manual scaffold\n');
+  await assert.rejects(fs.access(path.join(saved.problemFolder, 'main.py')), { code: 'ENOENT' });
 });

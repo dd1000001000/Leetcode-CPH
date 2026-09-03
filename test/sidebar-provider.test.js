@@ -45,15 +45,21 @@ test('sidebar provider renders a CSP-protected testcase UI', () => {
   assert.match(html, /运行全部测试用例/);
   assert.match(html, /实际输出/);
   assert.match(html, /差异（预期 \/ 实际）/);
+  assert.match(html, /diff-row\.changed/);
+  assert.match(html, /editorWarning-foreground/);
   assert.match(html, /同步代码到 LeetCode/);
   assert.match(html, /配置 AI/);
   assert.match(html, /反馈 Bug/);
+  assert.match(html, /id="notice-dismiss"/);
+  assert.match(html, /关闭通知/);
+  assert.match(html, /dismissNotice\(Number\(state\.noticeRevision/);
 });
 
 test('sidebar provider forwards manual testcase and sidebar actions', async () => {
   const calls = [];
   const provider = new LeetCodeCphSidebarProvider({
     onReady: () => calls.push(['ready']),
+    onDismissNotice: (payload) => { calls.push(['dismiss-notice', payload]); return { notice: '' }; },
     onAdd: (payload) => calls.push(['add', payload]),
     onUpdate: (payload) => calls.push(['update', payload]),
     onDelete: (payload) => calls.push(['delete', payload]),
@@ -79,6 +85,7 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
   await view.send({ type: 'sync' });
   await view.send({ type: 'configureAI' });
   await view.send({ type: 'openBugReport' });
+  await view.send({ type: 'dismissNotice', revision: 7 });
 
   assert.deepEqual(calls, [
     ['ready'],
@@ -89,12 +96,34 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
     ['run-all'],
     ['sync'],
     ['configure'],
-    ['bug']
+    ['bug'],
+    ['dismiss-notice', { revision: 7 }]
   ]);
   assert.equal(view.webview.options.enableScripts, true);
   assert.equal(view.received.at(-1).state.problem.title, '1. Two Sum');
   assert.equal(view.received.at(-1).state.problem.aiStatus, '已配置 GLM');
   assert.equal(view.received.at(-1).state.testCases.length, 1);
+  provider.dispose();
+});
+
+test('sidebar notice can be dismissed while another action is still in flight', async () => {
+  let release;
+  const calls = [];
+  const provider = new LeetCodeCphSidebarProvider({
+    onAdd: async () => new Promise((resolve) => { release = resolve; }),
+    onDismissNotice: (payload) => { calls.push(payload); return { notice: '' }; }
+  });
+  provider.setState({ notice: 'AI 已完成。', noticeRevision: 11 });
+  const view = makeView();
+  provider.resolveWebviewView(view);
+
+  const pendingAction = view.send({ type: 'addTestCase' });
+  await Promise.resolve();
+  await view.send({ type: 'dismissNotice', revision: 11 });
+  assert.deepEqual(calls, [{ revision: 11 }]);
+  assert.equal(view.received.at(-1).state.notice, '');
+  release();
+  await pendingAction;
   provider.dispose();
 });
 
@@ -127,5 +156,25 @@ test('sidebar ignores a duplicate action while the first action is still pending
   release();
   await Promise.all([first, duplicate]);
   assert.deepEqual(calls, [{}]);
+  provider.dispose();
+});
+
+test('sidebar rejects add, update, and delete messages while an AI job is active', async () => {
+  const calls = [];
+  const provider = new LeetCodeCphSidebarProvider({
+    onAdd: () => calls.push('add'),
+    onUpdate: () => calls.push('update'),
+    onDelete: () => calls.push('delete')
+  });
+  provider.setState({ problem: { title: 'Two Sum', aiBusy: true } });
+  const view = makeView();
+  provider.resolveWebviewView(view);
+
+  await view.send({ type: 'addTestCase' });
+  await view.send({ type: 'updateTestCase', id: 'one', input: 'x', expectedOutput: 'y' });
+  await view.send({ type: 'deleteTestCase', id: 'one' });
+
+  assert.deepEqual(calls, []);
+  assert.match(view.received.at(-1).state.error, /AI 正在.*请等待/);
   provider.dispose();
 });
