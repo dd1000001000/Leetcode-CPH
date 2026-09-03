@@ -2,7 +2,7 @@
   "name": "leetcode-cph-receiver",
   "displayName": "LeetCode CPH",
   "description": "Capture LeetCode problems, manage test cases in the sidebar, generate AI test scaffolds, and sync code back to the browser.",
-  "version": "0.5.1",
+  "version": "0.6.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -39,7 +39,7 @@
     "configuration": {
       "title": "LeetCode CPH",
       "properties": {
-        "leetcodeCph.outputDirectory": { "type": "string", "default": "leetcode", "description": "Folder inside the current workspace where title-named solution files are stored. Problem metadata and generated tests remain in private extension storage." },
+        "leetcodeCph.outputDirectory": { "type": "string", "default": "leetcode", "description": "Folder inside the current workspace where each captured problem gets a title-named directory containing solution.<ext> and its AI-generated main.<ext>. Metadata, test cases, and backups remain in private extension storage." },
         "leetcodeCph.openSolutionAfterCapture": { "type": "boolean", "default": true, "description": "Open the saved solution file after a capture arrives." },
         "leetcodeCph.ai.provider": {
           "type": "string",
