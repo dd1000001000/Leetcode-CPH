@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LeetCode CPH Capture",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Capture the current LeetCode problem and editor code into VS Code.",
   "permissions": ["activeTab", "tabs", "scripting", "alarms"],
   "host_permissions": [

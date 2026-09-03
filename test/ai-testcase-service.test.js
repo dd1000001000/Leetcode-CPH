@@ -110,6 +110,38 @@ test('generation sends the chosen provider request and returns fence-free scaffo
   assert.equal(JSON.stringify(result).includes(apiKey), false);
 });
 
+test('scaffold prompt requires the relative private runtime solution copy and never embeds a user path', async () => {
+  const apiKey = 'runtime-contract-key';
+  const userVisiblePath = 'C:\\Users\\Alice\\leetcode\\two-sum.py';
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
+  let prompt = '';
+  const service = createAiTestcaseService({
+    secrets,
+    request: async (request) => {
+      prompt = request.body.messages[1].content;
+      return successfulResponse();
+    }
+  });
+
+  await service.generateScaffold({
+    metadata: {
+      ...metadata,
+      runtimeSolutionFileName: 'solution.py',
+      solutionPath: userVisiblePath
+    },
+    solutionCode: 'class Solution:\n    pass',
+    testCases,
+    operation: { type: 'initialize' },
+    provider: 'glm'
+  });
+
+  assert.match(prompt, /"runtimeSolutionFileName": "solution\.py"/);
+  assert.match(prompt, /copied next to this scaffold/i);
+  assert.match(prompt, /exact relative filename/i);
+  assert.match(prompt, /never embed an absolute local path/i);
+  assert.equal(prompt.includes(userVisiblePath), false);
+});
+
 test('each supported provider uses its fixed HTTPS endpoint and default model', async () => {
   for (const provider of Object.keys(PROVIDERS)) {
     const secrets = makeSecrets({ [secretKeyFor(provider)]: `${provider}-key` });

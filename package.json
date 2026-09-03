@@ -1,7 +1,7 @@
 {
   "name": "leetcode-cph",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.1",
   "description": "LeetCode CPH: Edge extension + VS Code receiver.",
   "scripts": {
     "test": "node --test test/"

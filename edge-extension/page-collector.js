@@ -67,6 +67,15 @@
 
   function editorModel() {
     try {
+      const editors = window.monaco?.editor?.getEditors?.() || [];
+      const focused = editors.find((editor) => editor?.hasTextFocus?.());
+      const visible = editors.find((editor) => {
+        const node = editor?.getDomNode?.();
+        return node && node.getClientRects?.().length && getComputedStyle(node).visibility !== 'hidden';
+      });
+      const activeModel = (focused || visible || editors[0])?.getModel?.();
+      if (activeModel?.getValue) return activeModel;
+
       const models = window.monaco?.editor?.getModels?.() || [];
       const values = models.map((model) => model.getValue()).filter(Boolean);
       if (values.length) {
@@ -77,19 +86,21 @@
     return null;
   }
 
-  function code() {
+  function codeSnapshot() {
     // LeetCode currently uses Monaco in many views. Its model contains the full,
     // non-virtualised text; the DOM fallback supports older CodeMirror layouts.
     const model = editorModel();
-    if (model) return model.getValue();
+    if (model) return { ready: true, value: model.getValue() };
 
-    const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea, textarea');
-    if (textarea?.value?.trim()) return textarea.value;
-    const codeMirror = document.querySelector('.CodeMirror-code')?.innerText;
-    if (codeMirror?.trim()) return codeMirror;
-    const monacoLines = [...document.querySelectorAll('.monaco-editor .view-line')]
-      .map((line) => line.innerText).join('\n');
-    return monacoLines.trim();
+    const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea');
+    if (textarea) return { ready: true, value: textarea.value || '' };
+    const codeMirror = document.querySelector('.CodeMirror-code');
+    if (codeMirror) return { ready: true, value: codeMirror.innerText || '' };
+    const monacoLineNodes = [...document.querySelectorAll('.monaco-editor .view-line')];
+    if (monacoLineNodes.length) {
+      return { ready: true, value: monacoLineNodes.map((line) => line.innerText).join('\n') };
+    }
+    return { ready: false, value: '' };
   }
 
   function language() {
@@ -144,7 +155,7 @@
       return { ok: true, language: pageLanguage || expectedLanguage || 'unknown' };
     }
 
-    const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea, textarea');
+    const textarea = document.querySelector('[data-cy="code-editor"] textarea, .monaco-editor textarea');
     if (textarea) {
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
       setter ? setter.call(textarea, newCode) : (textarea.value = newCode);
@@ -160,6 +171,7 @@
       const problemText = description();
       const slug = problemSlug();
       const problemSamples = samples(problemText);
+      const editor = codeSnapshot();
       return {
         source: location.href,
         problemSlug: slug,
@@ -171,7 +183,8 @@
         // Keep the examples as page context only.  The VS Code extension uses
         // the user's configured AI provider to extract the editable testcase
         // list; no brittle DOM regex result is treated as testcase data.
-        code: code(),
+        code: editor.value,
+        editorReady: editor.ready,
         language: language(),
         capturedAt: new Date().toISOString()
       };

@@ -230,6 +230,7 @@ function normalizeProblem(metadata, language) {
     problemId: String(metadata.problemId || '').trim(),
     problemSlug: String(metadata.problemSlug || '').trim(),
     language: String(language || metadata.language || 'unknown').trim() || 'unknown',
+    runtimeSolutionFileName: String(metadata.runtimeSolutionFileName || '').trim(),
     description: truncate(metadata.description, 35_000)
   };
 }
@@ -359,6 +360,7 @@ function buildScaffoldPrompt({ metadata, solutionCode, testCases, operation, exi
   return [
     'You are a local LeetCode test-scaffold generator. Output only one complete, saveable, runnable test source file. Do not output Markdown code fences, explanations, headings, or natural-language prose.',
     'Task: generate or update a test scaffold from the problem, solutionCode, and the complete testCases list. solutionCode is the code under test; never modify it, overwrite it, copy it as a replacement, or fabricate an implementation.',
+    'At runtime the user solution is copied next to this scaffold under problem.runtimeSolutionFileName. Import or load that exact relative filename; never embed an absolute local path. The scaffold itself is stored privately and must not expect the user-visible filename.',
     'Every testCases entry must map to exactly one recognizable test. Its test name must appear verbatim (for example, testcase 001). Use assertion or test mechanisms that are conventional for the target language and need no complex extra setup. Implement input parsing and output comparison adapters when necessary.',
     'Runtime protocol is mandatory. The generated file must run from its own directory with no selector (all cases) and with `--case <exact testcase name>` (only that case). For every executed case, print exactly one stdout line beginning with `__LEETCODE_CPH_RESULT__` followed by JSON with this shape: {"name":"testcase 001","actual":<JSON-serializable actual result>,"passed":<boolean>}. The `actual` value must be the real result from the solution, never the expected value. Emit a result even for a failed comparison, then exit non-zero only for a genuine runtime/setup failure. Do not require external packages. For a blank user-created case whose input and expectedOutput are both empty, keep a recognizable non-executing placeholder named after that case; do not invent input or expected output and do not emit a runtime result for it until the user fills a field.',
     'When operation.type is initialize, create the initial scaffold from the complete testCases list. When it is add or update, ensure the affected case reflects its current data. When it is delete, ensure the operation.testCase is no longer present in the scaffold. Preserve every case that remains in the complete testCases list. If existingScaffold is non-empty, preserve its existing framework and entry point whenever possible, while upgrading it to the runtime protocol above.',

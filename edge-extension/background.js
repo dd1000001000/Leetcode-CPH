@@ -54,21 +54,37 @@ async function collect(tabId) {
     files: ['page-collector.js'],
     world: 'MAIN'
   });
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    func: () => {
-      try {
-        return { ok: true, payload: window.__LEETCODE_CPH_COLLECT__?.() };
-      } catch (error) {
-        return { ok: false, error: error.message || '未能读取题目页面。' };
+  let missing = [];
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        try {
+          return { ok: true, payload: window.__LEETCODE_CPH_COLLECT__?.() };
+        } catch (error) {
+          return { ok: false, error: error.message || '未能读取题目页面。' };
+        }
+      }
+    });
+    if (!result?.result?.ok || !result.result.payload) {
+      if (attempt === 7) throw new Error(result?.result?.error || '未能读取题目页面。');
+    } else {
+      const payload = result.result.payload;
+      missing = [];
+      if (!payload.problemSlug) missing.push('题目地址');
+      if (!payload.title || payload.title === 'Untitled Problem') missing.push('题目标题');
+      if (!payload.description) missing.push('题面');
+      if (!payload.language) missing.push('编程语言');
+      if (!payload.editorReady) missing.push('代码编辑器');
+      if (!missing.length) {
+        delete payload.editorReady;
+        return payload;
       }
     }
-  });
-  if (!result?.result?.ok || !result.result.payload) {
-    throw new Error(result?.result?.error || '未能读取题目页面。');
+    if (attempt < 7) await new Promise((resolve) => setTimeout(resolve, 400));
   }
-  return result.result.payload;
+  throw new Error(`力扣页面尚未加载完成（缺少：${missing.join('、')}）。请等待题面和代码编辑器显示后重试。`);
 }
 
 // Prefer `tab.pendingUrl` over `tab.url`: while a tab is navigating, `url`
@@ -167,7 +183,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `本地接收端返回 ${response.status}`);
-    await setState(tabId, 'OK', '#137333', `已保存：${body.folder}`);
+    await setState(tabId, 'OK', '#137333', `已保存：${body.file || body.folder}`);
   } catch (error) {
     const message = error.message || '保存失败。';
     if (tabId) await setState(tabId, '!', '#b3261e', message);
