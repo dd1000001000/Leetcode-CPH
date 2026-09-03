@@ -111,6 +111,62 @@ test('generation sends the chosen provider request and returns fence-free scaffo
   assert.equal(JSON.stringify(result).includes(apiKey), false);
 });
 
+test('an in-flight extraction abort is propagated without misleading provider or API-key wrapping', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: 'glm-key' });
+  let signalRequestStarted;
+  const requestStarted = new Promise((resolve) => { signalRequestStarted = resolve; });
+  let receivedSignal;
+  const service = createAiTestcaseService({
+    secrets,
+    request: ({ signal }) => new Promise((_, reject) => {
+      receivedSignal = signal;
+      signalRequestStarted();
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    })
+  });
+  const controller = new AbortController();
+  const pending = service.extractTestCases({ metadata, provider: 'glm', signal: controller.signal });
+  await requestStarted;
+  const cancellation = Object.assign(new Error('题目文件已删除。'), {
+    name: 'AbortError', code: 'LEETCODE_CPH_AI_CANCELLED'
+  });
+  controller.abort(cancellation);
+
+  await assert.rejects(pending, (error) => {
+    assert.equal(error, cancellation);
+    assert.doesNotMatch(error.message, /API Key|网络|调用 GLM/);
+    return true;
+  });
+  assert.equal(receivedSignal, controller.signal);
+});
+
+test('an already-cancelled scaffold request never contacts the configured provider', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: 'glm-key' });
+  let requestCalls = 0;
+  const service = createAiTestcaseService({
+    secrets,
+    request: async () => {
+      requestCalls += 1;
+      return successfulResponse();
+    }
+  });
+  const controller = new AbortController();
+  const cancellation = Object.assign(new Error('main 已删除。'), {
+    name: 'AbortError', code: 'LEETCODE_CPH_AI_CANCELLED'
+  });
+  controller.abort(cancellation);
+
+  await assert.rejects(service.generateScaffold({
+    metadata,
+    solutionCode: 'class Solution: pass',
+    testCases,
+    operation: { type: 'regenerate' },
+    provider: 'glm',
+    signal: controller.signal
+  }), (error) => error === cancellation);
+  assert.equal(requestCalls, 0);
+});
+
 test('scaffold prompt uses the metadata-recorded solution basename and never embeds a user path', async () => {
   const apiKey = 'runtime-contract-key';
   const userVisiblePath = 'C:\\Users\\Alice\\leetcode\\two-sum.py';

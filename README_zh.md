@@ -50,13 +50,13 @@ LeetCode CPH 需要同时安装浏览器扩展和 VS Code 插件。
 
 1. 在 VS Code 中打开“扩展”面板。
 2. 点击 `...`，选择“从 VSIX 安装…” 。
-3. 选择 `leetcode-cph-receiver-0.8.0.vsix`（或你构建的更新版本）。
+3. 选择 `leetcode-cph-receiver-0.8.1.vsix`（或你构建的更新版本）。
 4. 安装后重新加载 VS Code。
 
 也可以在终端中安装：
 
 ```powershell
-code --install-extension .\vscode-extension\leetcode-cph-receiver-0.8.0.vsix
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.8.1.vsix
 ```
 
 如需从源码构建 VSIX，请运行：

@@ -84,6 +84,20 @@ async function createLinkOrSkip(t, target, linkPath, type) {
   }
 }
 
+async function settleWithoutReleasingProvider(promise, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message || 'operation did not cancel promptly')), 750);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 test('overlapping testcase AI jobs retain busy ownership until every caller finishes', () => {
   const sandbox = loadExtension({ workspace: { textDocuments: [] }, window: {} });
   sandbox.testIdentityKey = path.resolve('shared-problem');
@@ -1267,6 +1281,414 @@ test('moving a problem directory during scaffold generation interrupts and super
   await assert.rejects(fs.access(path.join(movedDirectory, 'main.py')));
 });
 
+test('deleting solution during capture extraction cancels immediately and never applies the late AI result', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-delete-during-extraction-'));
+  temporaryFolders.push(root);
+  let signalExtractionStarted;
+  let releaseExtraction;
+  let receivedSignal;
+  let scaffoldCalls = 0;
+  const extractionStarted = new Promise((resolve) => { signalExtractionStarted = resolve; });
+  const extractionGate = new Promise((resolve) => { releaseExtraction = resolve; });
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: { showTextDocument: async () => {}, showWarningMessage: () => {} }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async extractTestCases({ signal }) {
+      receivedSignal = signal;
+      signalExtractionStarted();
+      return extractionGate;
+    },
+    async generateScaffold() {
+      scaffoldCalls += 1;
+      return { content: '# must not be written\n', provider: 'glm', model: 'glm-5.2' };
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+  const payload = {
+    title: 'Delete During Extraction', source: 'https://leetcode.com/problems/delete-during-extraction/',
+    problemSlug: 'delete-during-extraction', language: 'Python3', description: '', samples: '',
+    code: 'class Solution: pass\n'
+  };
+  const saved = await sandbox.saveCapture(payload);
+  const processing = sandbox.processCapturedAi(payload, saved);
+  await extractionStarted;
+
+  await fs.unlink(saved.solution);
+  const deletion = sandbox.handleProblemDeletes({
+    files: [{ scheme: 'file', fsPath: saved.solution }]
+  });
+  assert.equal(sandbox.captureJobActiveForFolder(saved.problemFolder), false);
+  assert.equal(receivedSignal.aborted, true);
+  const result = await settleWithoutReleasingProvider(
+    processing,
+    'capture extraction remained blocked after solution deletion'
+  );
+  assert.equal(result.superseded, true);
+  await deletion;
+
+  const metadata = JSON.parse(await fs.readFile(path.join(saved.problemFolder, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.testcaseExtraction.status, 'failed');
+  assert.match(metadata.testcaseExtraction.message, /被删除/);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(saved.problemFolder, 'testcases.json'), 'utf8')).testCases, []);
+  assert.equal(scaffoldCalls, 0);
+  await assert.rejects(fs.access(saved.solution));
+  await assert.rejects(fs.access(path.join(path.dirname(saved.solution), 'main.py')));
+
+  releaseExtraction({
+    testCases: [{ input: 'late = true', expectedOutput: 'late', evidence: 'late' }],
+    provider: 'glm', model: 'glm-5.2'
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(fs.access(saved.solution));
+  await assert.rejects(fs.access(path.join(path.dirname(saved.solution), 'main.py')));
+});
+
+test('deleting tracked files during capture scaffold generation never revives them or writes main', async (t) => {
+  const targets = ['solution', 'main', 'metadata', 'testcases', 'state', 'problem'];
+  for (const target of targets) {
+    await t.test(target, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), `leetcode-cph-delete-${target}-during-scaffold-`));
+      temporaryFolders.push(root);
+      let signalGenerationStarted;
+      let releaseGeneration;
+      let receivedSignal;
+      const generationStarted = new Promise((resolve) => { signalGenerationStarted = resolve; });
+      const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+      const vscodeStub = {
+        workspace: {
+          isTrusted: true,
+          workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+          getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+        },
+        window: { showTextDocument: async () => {}, showWarningMessage: () => {} }
+      };
+      const sandbox = loadExtension(vscodeStub);
+      sandbox.injectedAiService = {
+        async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+        async extractTestCases() {
+          return {
+            testCases: [{ input: 'x = 1', expectedOutput: '1', evidence: 'Input: x = 1 Output: 1' }],
+            provider: 'glm', model: 'glm-5.2'
+          };
+        },
+        async generateScaffold({ signal }) {
+          receivedSignal = signal;
+          signalGenerationStarted();
+          return generationGate;
+        }
+      };
+      vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+      const payload = {
+        title: `Delete ${target}`, source: `https://leetcode.com/problems/delete-${target}/`,
+        problemSlug: `delete-${target}`, language: 'Python3', description: '', samples: '',
+        code: 'class Solution: pass\n'
+      };
+      const saved = await sandbox.saveCapture(payload);
+      const problemDirectory = path.dirname(saved.solution);
+      const mainPath = path.join(problemDirectory, 'main.py');
+      if (target === 'main') await fs.writeFile(mainPath, '# existing main\n', 'utf8');
+      vscodeStub.window.activeTextEditor = {
+        document: { uri: { scheme: 'file', fsPath: saved.solution }, getText: () => payload.code }
+      };
+      const processing = sandbox.processCapturedAi(payload, saved);
+      await generationStarted;
+
+      const deletedPath = target === 'solution' ? saved.solution
+        : target === 'main' ? mainPath
+          : target === 'metadata' ? path.join(saved.problemFolder, 'metadata.json')
+            : target === 'testcases' ? path.join(saved.problemFolder, 'testcases.json')
+              : target === 'state' ? saved.problemFolder : problemDirectory;
+      await fs.rm(deletedPath, { recursive: target === 'state' || target === 'problem', force: true });
+      const deletion = sandbox.handleProblemDeletes({
+        files: [{ scheme: 'file', fsPath: deletedPath }]
+      });
+      assert.equal(sandbox.captureJobActiveForFolder(saved.problemFolder), false);
+      assert.equal(receivedSignal.aborted, true);
+      const result = await settleWithoutReleasingProvider(
+        processing,
+        `scaffold generation remained blocked after deleting ${target}`
+      );
+      assert.equal(result.superseded, true);
+      await deletion;
+
+      if (target === 'testcases') {
+        const state = await sandbox.sidebarState();
+        assert.equal(state.problem.aiBusy, false);
+        assert.equal(state.problem.scaffoldReady, false);
+      }
+      await assert.rejects(fs.access(deletedPath));
+      await assert.rejects(fs.access(mainPath));
+      await assert.rejects(fs.access(path.join(saved.problemFolder, 'backups')));
+
+      releaseGeneration({ content: '# late generated main\n', provider: 'glm', model: 'glm-5.2' });
+      await new Promise((resolve) => setImmediate(resolve));
+      await assert.rejects(fs.access(deletedPath));
+      await assert.rejects(fs.access(mainPath));
+    });
+  }
+});
+
+test('deleting an unrelated sibling file does not cancel capture extraction', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-unrelated-delete-'));
+  temporaryFolders.push(root);
+  let signalExtractionStarted;
+  let releaseExtraction;
+  let receivedSignal;
+  const extractionStarted = new Promise((resolve) => { signalExtractionStarted = resolve; });
+  const extractionGate = new Promise((resolve) => { releaseExtraction = resolve; });
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: { showTextDocument: async () => {}, showWarningMessage: () => {} }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async extractTestCases({ signal }) {
+      receivedSignal = signal;
+      signalExtractionStarted();
+      return extractionGate;
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+  const payload = {
+    title: 'Unrelated Delete', source: 'https://leetcode.com/problems/unrelated-delete/',
+    language: 'Python3', code: 'class Solution: pass\n'
+  };
+  const saved = await sandbox.saveCapture(payload);
+  const processing = sandbox.processCapturedAi(payload, saved);
+  await extractionStarted;
+  const readmePath = path.join(path.dirname(saved.solution), 'README.md');
+  await fs.writeFile(readmePath, 'notes\n', 'utf8');
+  await fs.unlink(readmePath);
+  const cancelled = await sandbox.handleProblemDeletes({ files: [{ scheme: 'file', fsPath: readmePath }] });
+  assert.equal(cancelled.length, 0);
+  assert.equal(receivedSignal.aborted, false);
+  assert.equal(sandbox.captureJobActiveForFolder(saved.problemFolder), true);
+
+  releaseExtraction({ testCases: [], provider: 'glm', model: 'glm-5.2' });
+  const result = await processing;
+  assert.equal(result.superseded, undefined);
+  assert.equal(sandbox.captureJobActiveForFolder(saved.problemFolder), false);
+});
+
+test('snapshot revalidation rejects an external testcase deletion even without a VS Code delete event', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-external-delete-'));
+  temporaryFolders.push(root);
+  let signalGenerationStarted;
+  let releaseGeneration;
+  const generationStarted = new Promise((resolve) => { signalGenerationStarted = resolve; });
+  const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: { showTextDocument: async () => {}, showWarningMessage: () => {} }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async extractTestCases() {
+      return {
+        testCases: [{ input: 'x = 1', expectedOutput: '1', evidence: 'Input: x = 1 Output: 1' }],
+        provider: 'glm', model: 'glm-5.2'
+      };
+    },
+    async generateScaffold() {
+      signalGenerationStarted();
+      return generationGate;
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+  const payload = {
+    title: 'External Delete', source: 'https://leetcode.com/problems/external-delete/',
+    language: 'Python3', code: 'class Solution: pass\n'
+  };
+  const saved = await sandbox.saveCapture(payload);
+  const processing = sandbox.processCapturedAi(payload, saved);
+  await generationStarted;
+  const testCasesPath = path.join(saved.problemFolder, 'testcases.json');
+  await fs.unlink(testCasesPath);
+  releaseGeneration({ content: '# stale generated main\n', provider: 'glm', model: 'glm-5.2' });
+  await assert.rejects(processing, (error) => error?.code === 'LEETCODE_CPH_AI_INPUT_INVALIDATED');
+  await assert.rejects(fs.access(testCasesPath));
+  await assert.rejects(fs.access(path.join(path.dirname(saved.solution), 'main.py')));
+});
+
+test('snapshot revalidation rejects external metadata modification during scaffold generation', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-external-metadata-mutate-'));
+  temporaryFolders.push(root);
+  let signalGenerationStarted;
+  let releaseGeneration;
+  const generationStarted = new Promise((resolve) => { signalGenerationStarted = resolve; });
+  const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }],
+      rootPath: root,
+      textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: { showTextDocument: async () => {} }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async generateScaffold() {
+      signalGenerationStarted();
+      return generationGate;
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+
+  const folder = path.join(root, 'leetcode', 'Revalidate Metadata');
+  const stateFolder = stateFolderFor(folder);
+  const solutionPath = path.join(folder, 'solution.py');
+  const mainPath = path.join(folder, 'main.py');
+  await fs.mkdir(stateFolder, { recursive: true });
+  await fs.mkdir(folder, { recursive: true });
+  await Promise.all([
+    fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
+    fs.writeFile(mainPath, '# existing main\n', 'utf8'),
+    fs.writeFile(path.join(stateFolder, 'testcases.json'), JSON.stringify({
+      version: 3,
+      testCases: [{
+        id: 'manual-1', name: 'testcase 001', input: 'x = 1', expectedOutput: '1', source: 'manual', createdAt: '2026-09-03T00:00:00.000Z'
+      }],
+      excludedAiIds: [],
+      excludedLeetCodeIds: []
+    }), 'utf8'),
+    fs.writeFile(path.join(stateFolder, 'metadata.json'), JSON.stringify(registeredMetadata({
+      title: 'Revalidate Metadata', source: 'https://leetcode.com/problems/revalidate-metadata/', language: 'Python3',
+      solutionFileName: 'solution.py', testcaseScaffoldStale: false
+    }), null, 2), 'utf8')
+  ]);
+  vscodeStub.window.activeTextEditor = {
+    document: {
+      uri: { scheme: 'file', fsPath: solutionPath },
+      getText: () => 'class Solution: pass\n'
+    }
+  };
+  const metadataPath = path.join(stateFolder, 'metadata.json');
+  const processing = sandbox.generateTestScaffold({
+    folder: stateFolder,
+    solutionPath,
+    code: 'class Solution: pass\n',
+    metadata: {
+      title: 'Revalidate Metadata',
+      source: 'https://leetcode.com/problems/revalidate-metadata/',
+      language: 'Python3',
+      solutionFileName: 'solution.py',
+      testcaseScaffoldStale: false
+    },
+    testCases: [{
+      id: 'manual-1', name: 'testcase 001', input: 'x = 1', expectedOutput: '1', source: 'manual', createdAt: '2026-09-03T00:00:00.000Z'
+    }]
+  }, [{ id: 'manual-1', name: 'testcase 001', input: 'x = 1', expectedOutput: '1', source: 'manual', createdAt: '2026-09-03T00:00:00.000Z' }], {
+    type: 'update'
+  });
+  await generationStarted;
+
+  const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  await fs.writeFile(metadataPath, JSON.stringify({ ...metadata, mark: 'mutated-outside' }, null, 2), 'utf8');
+  releaseGeneration({ content: '# generated main\n', provider: 'glm', model: 'glm-5.2' });
+  await assert.rejects(processing, (error) => error?.code === 'LEETCODE_CPH_AI_INPUT_INVALIDATED');
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# existing main\n');
+  assert.ok((await fs.readFile(metadataPath, 'utf8')).includes('mutated-outside'));
+  await assert.rejects(fs.access(path.join(stateFolder, 'backups')), { code: 'ENOENT' });
+});
+
+test('deleting main cancels an explicit scaffold regeneration and releases sidebar busy state immediately', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-delete-during-regenerate-'));
+  temporaryFolders.push(root);
+  let regenerationMode = false;
+  let signalGenerationStarted;
+  let releaseGeneration;
+  let receivedSignal;
+  const generationStarted = new Promise((resolve) => { signalGenerationStarted = resolve; });
+  const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: { showTextDocument: async () => {}, showWarningMessage: () => {} }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async extractTestCases() {
+      return {
+        testCases: [{ input: 'x = 1', expectedOutput: '1', evidence: 'Input: x = 1 Output: 1' }],
+        provider: 'glm', model: 'glm-5.2'
+      };
+    },
+    async generateScaffold({ signal }) {
+      if (!regenerationMode) {
+        return { content: '# initial main\n', provider: 'glm', model: 'glm-5.2' };
+      }
+      receivedSignal = signal;
+      signalGenerationStarted();
+      return generationGate;
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+  const payload = {
+    title: 'Delete During Regenerate', source: 'https://leetcode.com/problems/delete-during-regenerate/',
+    language: 'Python3', code: 'class Solution: pass\n'
+  };
+  const saved = await sandbox.saveCapture(payload);
+  await sandbox.processCapturedAi(payload, saved);
+  const mainPath = path.join(path.dirname(saved.solution), 'main.py');
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# initial main\n');
+  vscodeStub.window.activeTextEditor = {
+    document: { uri: { scheme: 'file', fsPath: saved.solution }, isDirty: false, getText: () => payload.code }
+  };
+
+  regenerationMode = true;
+  const action = sandbox.runSidebarAction(
+    'AI 正在重新编写 main 测试代码…',
+    () => sandbox.regenerateTestScaffold(),
+    '已重新编写测试脚手架。',
+    { testcaseMutation: true }
+  );
+  await generationStarted;
+  await fs.unlink(mainPath);
+  const deletion = sandbox.handleProblemDeletes({ files: [{ scheme: 'file', fsPath: mainPath }] });
+  sandbox.testFolderKey = sandbox.pathKey(saved.problemFolder);
+  assert.equal(vm.runInContext('activeTestcaseAiJobs.has(testFolderKey)', sandbox), false);
+  assert.equal(receivedSignal.aborted, true);
+  await settleWithoutReleasingProvider(
+    action,
+    'explicit regenerate action remained blocked after main deletion'
+  );
+  await deletion;
+  const actionState = sandbox.runtimeStateFor(null);
+  assert.equal(actionState.busy, false);
+  assert.equal(actionState.testcaseMutationBusy, false);
+  assert.match(actionState.error, /被删除/);
+  await assert.rejects(fs.access(mainPath));
+
+  releaseGeneration({ content: '# late regenerated main\n', provider: 'glm', model: 'glm-5.2' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(fs.access(mainPath));
+});
+
 test('a delayed directory rename event cannot fail a newer capture at the destination', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-delayed-folder-move-'));
   temporaryFolders.push(root);
@@ -1537,6 +1959,11 @@ test('AI scaffold replacement preserves the prior saved scaffold as a backup', a
   await Promise.all([
     fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
     fs.writeFile(scaffoldPath, oldScaffold, 'utf8'),
+    fs.writeFile(path.join(stateFolder, 'testcases.json'), JSON.stringify({
+      version: 3,
+      testCases: [{ id: 'manual-1', name: 'testcase 001', input: 'n = 1', expectedOutput: '1', source: 'manual' }],
+      excludedAiIds: [], excludedLeetCodeIds: []
+    }), 'utf8'),
     fs.writeFile(path.join(stateFolder, 'metadata.json'), JSON.stringify(registeredMetadata({
       title: '1. Two Sum', source: 'https://leetcode.com/problems/two-sum/', language: 'Python3',
       solutionFileName: 'solution.py', testcaseScaffoldStale: true
@@ -1587,6 +2014,11 @@ test('AI generation never overwrites main when it changes while the model reques
   await Promise.all([
     fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
     fs.writeFile(mainPath, '# old main\n', 'utf8'),
+    fs.writeFile(path.join(stateFolder, 'testcases.json'), JSON.stringify({
+      version: 3,
+      testCases: [{ id: 'one', name: 'testcase 001', input: '1', expectedOutput: '1', source: 'manual' }],
+      excludedAiIds: [], excludedLeetCodeIds: []
+    }), 'utf8'),
     fs.writeFile(path.join(stateFolder, 'metadata.json'), JSON.stringify(registeredMetadata({
       title: 'Race', source: 'https://leetcode.com/problems/race/', language: 'Python3',
       solutionFileName: 'solution.py', testcaseScaffoldStale: true
