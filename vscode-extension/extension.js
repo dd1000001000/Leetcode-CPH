@@ -39,15 +39,23 @@ let aiTestcaseService;
 let extensionStoragePath = '';
 const socketClients = new Set();
 const problemLocks = new Map();
-const approvedScaffoldHashes = new Map();
 const solutionRecordCache = new Map();
 const activeCaptureJobs = new Set();
 const supersededCaptureJobs = new Set();
-const activeTestcaseAiJobs = new Set();
+// Per-problem reference counts prevent overlapping callers from clearing each
+// other's busy state. A regenerate request can be queued behind a mutation,
+// so a plain Set/delete pair is not sufficient ownership tracking.
+const activeTestcaseAiJobs = new Map();
 // The companion Edge extension intentionally uses this fixed loopback port.
 // Keeping VS Code on the same fixed port avoids a configuration that looks
 // supported on one side but silently disconnects capture/sync on the other.
 const RECEIVER_PORT = 27121;
+// edge-extension/manifest.json contains a fixed public key, so its unpacked
+// Chromium extension ID is stable. Restrict the loopback receiver to that
+// exact extension origin: ordinary web pages can otherwise open localhost
+// WebSockets regardless of CORS and receive solution code sent by Sync.
+const COMPANION_EXTENSION_ID = 'lenchpcbgdkafhhfoeobicafbfhgklna';
+const COMPANION_EXTENSION_ORIGIN = `chrome-extension://${COMPANION_EXTENSION_ID}`;
 const SIDEBAR_NOTICE_TIMEOUT_MS = 15_000;
 // Keep transient sidebar state outside refreshSidebar().  Captures and active
 // editor changes can refresh the view while an AI mutation is in progress;
@@ -71,19 +79,6 @@ const EXTENSIONS = {
   csharp: 'cs', 'c#': 'cs', kotlin: 'kt', swift: 'swift', ruby: 'rb', php: 'php',
   scala: 'scala', haskell: 'hs', sql: 'sql'
 };
-
-const AI_REPAIRABLE_RUNNER_CODES = new Set([
-  'COMPILE_FAILED',
-  'COMPILE_TIMEOUT',
-  'COMPILE_OUTPUT_LIMIT_EXCEEDED',
-  'EXECUTION_TIMEOUT',
-  'OUTPUT_LIMIT_EXCEEDED',
-  'INVALID_RESULT_PROTOCOL',
-  'DUPLICATE_RESULT',
-  'RESULT_SET_MISMATCH',
-  'MISSING_RESULT_PROTOCOL',
-  'CASE_RUNTIME_ERROR'
-]);
 
 function slug(value) {
   return String(value || 'untitled-problem')
@@ -263,8 +258,32 @@ function captureJobKey(problemFolder, captureRevision) {
 
 function captureJobActiveForFolder(problemFolder) {
   const prefix = `${pathKey(problemFolder)}\0`;
-  for (const key of activeCaptureJobs) if (key.startsWith(prefix)) return true;
+  for (const key of activeCaptureJobs) {
+    if (key.startsWith(prefix) && !supersededCaptureJobs.has(key)) return true;
+  }
   return false;
+}
+
+function supersedeOlderCaptureJobs(problemFolder, currentRevision) {
+  const prefix = `${pathKey(problemFolder)}\0`;
+  const currentKey = captureJobKey(problemFolder, currentRevision);
+  for (const key of activeCaptureJobs) {
+    if (key.startsWith(prefix) && key !== currentKey) supersededCaptureJobs.add(key);
+  }
+}
+
+function beginTestcaseAiJob(identityKey) {
+  activeTestcaseAiJobs.set(identityKey, (activeTestcaseAiJobs.get(identityKey) || 0) + 1);
+}
+
+function endTestcaseAiJob(identityKey) {
+  const remaining = (activeTestcaseAiJobs.get(identityKey) || 0) - 1;
+  if (remaining > 0) activeTestcaseAiJobs.set(identityKey, remaining);
+  else activeTestcaseAiJobs.delete(identityKey);
+}
+
+function reservedSolutionFileName(filePath) {
+  return /^(?:main|testcase)\.[^.]+$/i.test(path.basename(String(filePath || '')));
 }
 
 function metadataSolutionPath(metadata) {
@@ -392,11 +411,18 @@ async function findStoredProblemFolderByArtifact(artifactPath) {
     if (await storedRecordOwnsArtifact(cached, artifactPath)) return cached;
     solutionRecordCache.delete(key);
   }
-  const name = path.basename(artifactPath);
-  if (/^solution\.[^.]+$/i.test(name)) return findStoredProblemFolderBySolution(artifactPath);
-  if (!/^main\.[^.]+$/i.test(name)) return '';
+  // A registered solution may be renamed by the user. The metadata path is
+  // the durable identity; relying on a literal solution.* basename makes the
+  // record disappear after an extension-host restart, once the in-memory
+  // cache is gone. Scan and revalidate both the recorded solution and its
+  // sibling main for every artifact name.
   const records = await listStoredProblemRecords();
   for (const record of records) {
+    if (pathKey(record.solutionPath) === key) {
+      if (!await storedRecordOwnsArtifact(record.folder, artifactPath)) continue;
+      cacheSolutionRecord(record.solutionPath, record.folder);
+      return record.folder;
+    }
     const expectedMain = path.join(path.dirname(record.solutionPath), `main${path.extname(record.solutionPath)}`);
     if (pathKey(expectedMain) !== key) continue;
     if (!await storedRecordOwnsArtifact(record.folder, artifactPath)) continue;
@@ -889,6 +915,10 @@ async function saveCapture(payload) {
     }
     clearCachedProblemFolder(folder);
     cacheSolutionRecord(solution, folder);
+    // A newer capture for the same record owns the UI and persisted state.
+    // Older provider requests may still be in flight, but they must no longer
+    // keep controls disabled or publish results when they eventually return.
+    supersedeOlderCaptureJobs(folder, captureRevision);
     const overwrittenRecordBackup = archivedRecords[0]?.destination || '';
     const overwrittenSolutionBackup = overwrittenRecordBackup
       ? path.join(overwrittenRecordBackup, `solution.${path.extname(archivedRecords[0].solutionPath).slice(1) || extension}.overwritten.bak`)
@@ -1037,6 +1067,7 @@ async function repairInterruptedCaptureJobs() {
   const records = await listStoredProblemRecords();
   for (const record of records) {
     if (record.metadata?.testcaseExtraction?.status !== 'pending') continue;
+    const scannedRevision = String(record.metadata?.captureRevision || '');
     await withProblemLock(record.folder, async () => {
       const metadataPath = path.join(record.folder, 'metadata.json');
       let metadata;
@@ -1045,7 +1076,8 @@ async function repairInterruptedCaptureJobs() {
       } catch (_) {
         return;
       }
-      if (metadata?.testcaseExtraction?.status !== 'pending') return;
+      if (metadata?.testcaseExtraction?.status !== 'pending'
+        || String(metadata?.captureRevision || '') !== scannedRevision) return;
       const message = '上次 AI 处理因 VS Code 重载而中断；请从浏览器重新抓取题目后重试。';
       const next = {
         ...metadata,
@@ -1069,6 +1101,11 @@ function respond(response, status, body) {
   // prevents arbitrary web pages from reading receiver responses.
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(body));
+}
+
+function isCompanionExtensionRequest(request) {
+  const origin = request?.headers?.origin;
+  return typeof origin === 'string' && origin === COMPANION_EXTENSION_ORIGIN;
 }
 
 function frame(payload) {
@@ -1109,6 +1146,7 @@ const MAX_SOCKET_FRAME_BYTES = 65_535;
 const MAX_SOCKET_BUFFER_BYTES = 128 * 1024;
 let heartbeatTimer;
 let sidebarNoticeTimer;
+let sidebarRefreshEpoch = 0;
 
 // The Edge extension lives in a Manifest V3 service worker, which the browser
 // may terminate while it is idle. That kills the WebSocket without VS Code
@@ -1184,7 +1222,9 @@ function consumeSocketData(client, chunk) {
 }
 
 function acceptWebSocket(request, socket) {
-  if (request.url !== '/ws' || request.headers.upgrade?.toLowerCase() !== 'websocket') return socket.destroy();
+  if (request.url !== '/ws'
+    || request.headers.upgrade?.toLowerCase() !== 'websocket'
+    || !isCompanionExtensionRequest(request)) return socket.destroy();
   const key = request.headers['sec-websocket-key'];
   if (!key || Array.isArray(key)) return socket.destroy();
   const accept = crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
@@ -1318,36 +1358,39 @@ function requireTrustedWorkspace(action) {
   }
 }
 
-async function confirmScaffoldExecution(scaffoldPath) {
+async function fileExecutionFingerprint(filePath) {
+  const content = await fs.readFile(filePath);
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+async function scaffoldExecutionFingerprint(scaffoldPath) {
   requireTrustedWorkspace('运行');
-  // Confirm the bytes that the runner will execute, rather than a possibly
-  // stale clean editor buffer. The runner checks this digest again directly
-  // before spawning the process.
-  const content = await fs.readFile(scaffoldPath);
-  const fingerprint = crypto.createHash('sha256').update(content).digest('hex');
-  const key = pathKey(scaffoldPath);
-  if (approvedScaffoldHashes.get(key) === fingerprint) return fingerprint;
-  const confirmLabel = '我已审阅，运行';
-  const reviewLabel = '查看测试代码';
-  // The API always exists in a real extension host. The conditional keeps the
-  // small Node-only test harness from needing a full VS Code UI mock.
-  if (typeof vscode.window.showWarningMessage === 'function') {
-    const answer = await vscode.window.showWarningMessage(
-      'main 测试代码由 AI 生成并与 solution 保存在同一题目目录，将以当前用户权限运行。可先点击“查看测试代码”进行审阅。',
-      { modal: true },
-      reviewLabel,
-      confirmLabel
+  // Snapshot the bytes that the runner will execute. The runner checks this
+  // digest again immediately before spawning so a concurrent replacement
+  // cannot change the code between validation and execution. Running from the
+  // sidebar deliberately requires no extra review/confirmation dialog.
+  return fileExecutionFingerprint(scaffoldPath);
+}
+
+async function assertRunInputsUnchanged(context, scaffoldPath, expectedSolutionHash, expectedScaffoldHash) {
+  const solutionDocument = openTextDocument(context.solutionPath);
+  const scaffoldDocument = openTextDocument(scaffoldPath);
+  if (solutionDocument?.isDirty || scaffoldDocument?.isDirty) {
+    throw Object.assign(
+      new Error('运行期间 solution 或 main 已被修改，本次结果已丢弃。请保存后重新运行。'),
+      { code: 'RUN_INPUT_CHANGED' }
     );
-    if (answer === reviewLabel) {
-      await vscode.window.showTextDocument(vscode.Uri.file(scaffoldPath), { preview: false });
-      throw new Error('已打开 AI 生成的测试代码；审阅后请再次点击运行。');
-    }
-    if (answer !== confirmLabel) {
-      throw new Error('已取消运行。请审阅测试脚手架后再确认运行。');
-    }
   }
-  approvedScaffoldHashes.set(key, fingerprint);
-  return fingerprint;
+  const [solutionHash, scaffoldHash] = await Promise.all([
+    fileExecutionFingerprint(context.solutionPath),
+    fileExecutionFingerprint(scaffoldPath)
+  ]);
+  if (solutionHash !== expectedSolutionHash || scaffoldHash !== expectedScaffoldHash) {
+    throw Object.assign(
+      new Error('运行期间 solution 或 main 已发生变化，本次结果已丢弃。请重新运行。'),
+      { code: 'RUN_INPUT_CHANGED' }
+    );
+  }
 }
 
 async function readOpenDocumentOrFile(filePath) {
@@ -1383,6 +1426,9 @@ async function activeProblemIdentity({ required = true } = {}) {
       if (!solutionPath || !await fileExists(solutionPath)) {
         throw new Error('找不到 main 对应的 solution 文件，请重新抓取题目。');
       }
+    }
+    if (reservedSolutionFileName(solutionPath)) {
+      throw new Error('题目解答不能命名为 main.<语言> 或 testcase.<语言>。请将解答文件改回 solution.<语言> 后重试。');
     }
     return {
       folder: storedFolder,
@@ -1618,11 +1664,14 @@ async function extractTestCasesForContext(context) {
 
 async function generateTestScaffold(context, testCases, operation) {
   if (context?.localOnly) throw new Error('该 solution 没有私有题目信息，不能生成 main 测试代码。');
+  if (reservedSolutionFileName(context?.solutionPath)) {
+    throw new Error('题目解答不能命名为 main.<语言> 或 testcase.<语言>，已拒绝覆盖。请将文件改回 solution.<语言>。');
+  }
   if (!aiTestcaseService) throw new Error('AI 服务尚未初始化，请重新加载 VS Code 扩展。');
   if (!Array.isArray(testCases)) {
     throw new Error('测试用例数据无效，无法生成测试脚手架。');
   }
-  if (operation?.type === 'initialize' && !testCases.length) {
+  if ((operation?.type === 'initialize' || operation?.type === 'regenerate') && !testCases.length) {
     throw new Error('当前没有测试用例，无法生成测试脚手架。');
   }
   requireTrustedWorkspace('生成');
@@ -1688,7 +1737,6 @@ async function generateTestScaffold(context, testCases, operation) {
     : '';
   if (backup) await writeTextAtomically(backup, existingScaffold);
   await writeTextAtomically(destination, generated.content);
-  approvedScaffoldHashes.delete(pathKey(destination));
   try {
     await markScaffoldFresh(context);
   } catch (error) {
@@ -1700,8 +1748,10 @@ async function generateTestScaffold(context, testCases, operation) {
   return { ...generated, destination, backup };
 }
 
-async function syncActiveSolution() {
+async function syncActiveSolution(expectedProblemKey) {
   const context = await activeProblemContext();
+  assertSidebarProblem(context, expectedProblemKey);
+  assertProblemAiIdle(context);
   if (context.localOnly) throw new Error('该 solution 没有对应的 LeetCode URL，不能安全同步。请从浏览器重新抓取题目。');
   vscode.window.setStatusBarMessage('LeetCode CPH: 正在同步到浏览器…');
   const result = await requestBrowserApply(browserApplyPayload(context));
@@ -1712,6 +1762,7 @@ async function syncActiveSolution() {
 }
 
 function setSidebarRuntime(patch = {}) {
+  sidebarRefreshEpoch += 1;
   const updatesNotice = Object.prototype.hasOwnProperty.call(patch, 'notice');
   if (updatesNotice) {
     sidebarRuntime.noticeRevision += 1;
@@ -1752,6 +1803,7 @@ function dismissSidebarNotice(revision) {
 
 function clearRunResults(folder) {
   if (folder && sidebarRuntime.resultFolder && pathKey(folder) !== pathKey(sidebarRuntime.resultFolder)) return;
+  sidebarRefreshEpoch += 1;
   sidebarRuntime.testResults = {};
   sidebarRuntime.resultFolder = '';
   sidebarProvider?.setState({ testResults: {} });
@@ -1775,8 +1827,33 @@ function runtimeStateFor(context) {
 function sidebarProblemKey(context) {
   // The webview only needs a stable opaque scope for unsaved card drafts. Do
   // not expose the workspace's absolute folder path just to distinguish two
-  // open problems.
-  return crypto.createHash('sha256').update(pathKey(context.folder)).digest('hex').slice(0, 24);
+  // open problems. Capture revision is part of the scope so a late webview
+  // message from an overwritten capture cannot mutate the new testcase set.
+  const captureRevision = String(context?.metadata?.captureRevision || '');
+  return crypto.createHash('sha256')
+    .update(`${pathKey(context.folder)}\0${captureRevision}`)
+    .digest('hex')
+    .slice(0, 24);
+}
+
+function assertSidebarProblem(context, expectedProblemKey) {
+  // Undefined is reserved for trusted in-process callers and tests. Webview
+  // messages are normalized to a string, so a missing/empty scope from the UI
+  // is rejected rather than silently targeting whichever editor is active.
+  if (expectedProblemKey === undefined || expectedProblemKey === null) return;
+  const expected = String(expectedProblemKey);
+  if (!expected || sidebarProblemKey(context) !== expected) {
+    throw new Error('当前编辑器已切换到另一道题。请在侧边栏刷新后重试。');
+  }
+}
+
+function assertProblemAiIdle(context) {
+  if (context?.localOnly) return;
+  const pendingExtraction = context?.metadata?.testcaseExtraction?.status === 'pending';
+  if (pendingExtraction || captureJobActiveForFolder(context.folder)
+    || activeTestcaseAiJobs.has(pathKey(context.folder))) {
+    throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后重试。');
+  }
 }
 
 async function sidebarState(extra = {}) {
@@ -1818,12 +1895,14 @@ async function sidebarState(extra = {}) {
   const extractionPending = persistedExtractionPending && activeCaptureJobs.has(
     captureJobKey(context.folder, context.metadata?.captureRevision)
   );
-  const aiBusy = !context.localOnly && (captureJobActiveForFolder(context.folder)
+  const aiBusy = !context.localOnly && (persistedExtractionPending
+    || captureJobActiveForFolder(context.folder)
     || activeTestcaseAiJobs.has(pathKey(context.folder)));
   // Background HTTP work cannot survive an extension-host reload. Do not
   // leave the sidebar permanently disabled by a durable "pending" marker
   // when no task for that exact capture revision exists in this process.
   const extractionInterrupted = persistedExtractionPending && !extractionPending;
+  const hasRunnableTestCases = context.testCases.some(testcaseHasRunnableData);
   const scaffoldReady = !context.localOnly && hasScaffold
     && !context.metadata?.testcaseScaffoldStale
     && !persistedExtractionPending
@@ -1841,6 +1920,8 @@ async function sidebarState(extra = {}) {
       aiBusy,
       localOnly: Boolean(context.localOnly),
       canSync: !context.localOnly,
+      canRegenerateScaffold: !context.localOnly && aiConfigured && hasRunnableTestCases
+        && !persistedExtractionPending && !aiBusy,
       scaffoldReady,
       runnerSupported,
       scaffoldStatus: context.localOnly
@@ -1851,7 +1932,7 @@ async function sidebarState(extra = {}) {
         ? '上次 AI 处理因 VS Code 重载而中断；请在浏览器重新抓取题目后重试。'
         : context.metadata?.testcaseScaffoldStale
         ? context.metadata?.testcaseScaffoldError
-          ? '测试脚手架生成失败；请重新抓取题目后重试。'
+          ? '测试脚手架生成失败；可点击“重新编写测试脚手架”重试。'
           : '测试脚手架需要更新'
         : hasScaffold ? runnerSupported
           ? '测试脚手架已生成，可使用本机对应语言工具链运行测试。'
@@ -1863,7 +1944,13 @@ async function sidebarState(extra = {}) {
 }
 
 async function refreshSidebar(extra = {}) {
+  const epoch = ++sidebarRefreshEpoch;
   const state = await sidebarState(extra);
+  // Several refreshes can overlap while a capture or provider lookup awaits
+  // I/O. Only the newest snapshot may reach the webview; returning undefined
+  // also prevents the provider message dispatcher from applying a stale
+  // callback result a second time.
+  if (epoch !== sidebarRefreshEpoch) return undefined;
   sidebarProvider?.setState(state);
   return state;
 }
@@ -1907,92 +1994,199 @@ async function configureAi() {
   return { provider: provider.id, model: model.trim() || PROVIDERS[provider.id].defaultModel };
 }
 
+async function markScaffoldStale(context, errorMessage = '') {
+  const { testcaseScaffoldError, ...metadataWithoutError } = context.metadata || {};
+  const nextMetadata = { ...metadataWithoutError, testcaseScaffoldStale: true };
+  if (errorMessage) nextMetadata.testcaseScaffoldError = errorMessage;
+  await writeTextAtomically(
+    path.join(context.folder, 'metadata.json'),
+    JSON.stringify(nextMetadata, null, 2)
+  );
+  context.metadata = nextMetadata;
+  return nextMetadata;
+}
+
+function testcaseDataChanged(previous, current) {
+  return String(previous?.input ?? '') !== String(current?.input ?? '')
+    || String(previous?.expectedOutput ?? '') !== String(current?.expectedOutput ?? '');
+}
+
+function pendingScaffoldDraft(testCase) {
+  if (!testCase || typeof testCase !== 'object') return false;
+  if (testCase.pendingScaffold === true) return true;
+  // Before the marker existed, an all-empty manual case could only have come
+  // from the Add button. Preserve that one-time first-save behavior.
+  return !Object.prototype.hasOwnProperty.call(testCase, 'pendingScaffold')
+    && testCase.source === 'manual'
+    && !testcaseHasRunnableData(testCase);
+}
+
+function projectedTestCaseUpdate(testCase, payload) {
+  const value = payload && typeof payload === 'object' ? payload : {};
+  const hasInput = Object.prototype.hasOwnProperty.call(value, 'input');
+  const hasExpected = Object.prototype.hasOwnProperty.call(value, 'expectedOutput')
+    || Object.prototype.hasOwnProperty.call(value, 'output');
+  return {
+    ...testCase,
+    input: hasInput ? value.input : testCase?.input,
+    expectedOutput: hasExpected
+      ? (Object.prototype.hasOwnProperty.call(value, 'expectedOutput') ? value.expectedOutput : value.output)
+      : testCase?.expectedOutput
+  };
+}
+
 async function mutateTestCaseAndScaffold(type, payload, onPersisted) {
   const identity = await activeProblemIdentity();
   const identityKey = pathKey(identity.folder);
   if (!identity.localOnly && (captureJobActiveForFolder(identity.folder) || activeTestcaseAiJobs.has(identityKey))) {
     throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后再修改测试用例。');
   }
-  if (!identity.localOnly) activeTestcaseAiJobs.add(identityKey);
+  let aiJobStarted = false;
   try {
     return await withProblemLock(identity.folder, async () => {
-    let context = await problemContextFromIdentity(identity);
-    const localOnly = Boolean(context.localOnly);
-    const ai = localOnly ? { configured: false, provider: 'glm' } : await configuredAiState();
-    if (!localOnly) requireTrustedWorkspace('更新');
-    // Persist the store while holding the same lock as capture and scaffold
-    // writes. A remote model failure must never discard a user's add/edit/
-    // delete; it merely leaves the generated scaffold marked stale for retry.
-    context = await ensurePersistedTestCases(context);
-    const previousState = await loadSanitizedTestCaseState(context.folder);
-    const previousMetadata = context.metadata;
-    context = { ...context, testCases: previousState.testCases };
-    let metadataMarkedStale = false;
-    if (!localOnly && await fileExists(scaffoldFilePath(context))) {
-      // Invalidate before changing testcases.json. If a crash happens after
-      // the testcase write, the old scaffold cannot be presented as runnable.
-      const staleMetadata = { ...context.metadata, testcaseScaffoldStale: true };
-      await writeTextAtomically(path.join(context.folder, 'metadata.json'), JSON.stringify(staleMetadata, null, 2));
-      context.metadata = staleMetadata;
-      metadataMarkedStale = true;
-    }
+      let context = await problemContextFromIdentity(identity);
+      const localOnly = Boolean(context.localOnly);
+      assertSidebarProblem(context, payload?.problemKey);
+      assertProblemAiIdle(context);
+      // Persist the user's edit before any optional network request. A failed
+      // model call must never discard data entered in the sidebar.
+      context = await ensurePersistedTestCases(context);
+      const previousState = await loadSanitizedTestCaseState(context.folder);
+      context = { ...context, testCases: previousState.testCases };
 
-    let changed;
-    try {
-      if (type === 'add') {
-        changed = await createTestCase(context.folder, payload);
-      } else if (type === 'update') {
-        changed = await updateTestCase(context.folder, payload?.id, payload);
-      } else if (type === 'delete') {
-        changed = await deleteTestCase(context.folder, payload?.id);
-      } else {
-        throw new Error('未知的测试用例操作。');
+      const requestedId = String(payload?.id || '');
+      const previousCase = requestedId
+        ? previousState.testCases.find((testCase) => testCase.id === requestedId)
+        : null;
+      const plannedFirstSave = type === 'update'
+        && pendingScaffoldDraft(previousCase)
+        && testcaseHasRunnableData(projectedTestCaseUpdate(previousCase, payload));
+      const plannedGeneration = !localOnly
+        && ((type === 'delete' && Boolean(previousCase)) || plannedFirstSave);
+      const previousMetadata = context.metadata;
+      let metadataMarkedStale = false;
+      if (plannedGeneration) {
+        // Invalidate main before committing testcases.json. If the extension
+        // host stops between the two writes, the old scaffold remains safely
+        // non-runnable instead of being paired with a newer testcase set.
+        await markScaffoldStale(context);
+        metadataMarkedStale = true;
       }
-    } catch (error) {
-      // No testcase mutation was persisted, so restore the otherwise
-      // unnecessary stale marker when the local mutation itself failed.
-      if (metadataMarkedStale) {
-        await writeTextAtomically(path.join(context.folder, 'metadata.json'), JSON.stringify(previousMetadata, null, 2)).catch(() => {});
-      }
-      throw error;
-    }
 
-    const affected = type === 'delete' ? changed.deleted : changed.testCase;
-    try {
-      // Show the newly empty card (or remove a deleted one) immediately while
-      // the model is updating main.*. Controls remain locked by the
-      // durable testcaseMutationBusy state set by the caller.
+      let changed;
+      try {
+        if (type === 'add') {
+          // The green add button always creates an empty draft. Test data can
+          // only enter the store through the card's explicit Save action.
+          changed = await createTestCase(context.folder, {});
+        } else if (type === 'update') {
+          changed = await updateTestCase(context.folder, payload?.id, payload);
+        } else if (type === 'delete') {
+          changed = await deleteTestCase(context.folder, payload?.id);
+        } else {
+          throw new Error('未知的测试用例操作。');
+        }
+      } catch (error) {
+        if (metadataMarkedStale) {
+          // No testcase change was committed. Restore the prior state when
+          // possible; if restoration itself fails, leaving stale=true is the
+          // conservative and safe outcome.
+          await writeTextAtomically(
+            path.join(context.folder, 'metadata.json'),
+            JSON.stringify(previousMetadata, null, 2)
+          ).catch((writeError) => {
+            outputChannel?.appendLine(`Could not restore metadata after a failed testcase mutation: ${writeError.message}`);
+          });
+        }
+        throw error;
+      }
+
+      const affected = type === 'delete' ? changed.deleted : changed.testCase;
+      const completedNewCase = type === 'update'
+        && pendingScaffoldDraft(changed.previous)
+        && testcaseHasRunnableData(changed.testCase);
+      const deletedScaffoldCase = type === 'delete';
+      const requiresGeneration = !localOnly && (completedNewCase || deletedScaffoldCase);
+      const editedExistingCase = type === 'update'
+        && testcaseDataChanged(changed.previous, changed.testCase)
+        && !completedNewCase;
+
       clearRunResults(context.folder);
-      if (typeof onPersisted === 'function') await onPersisted({ ...changed, context });
-      if (localOnly) return { ...changed, generated: null, localOnly: true };
-      // Manual cases are useful even before an API key is configured.  They
-      // are persisted as the user's own data, but we never fabricate or
-      // regex-extract a scaffold in that situation.  The next capture after
-      // configuration will use the selected model to generate/update it.
-      if (!ai.configured) {
-        throw new Error(`未配置 ${providerInfo(ai.provider).label} API Key，无法自动更新测试脚手架。请先点击“配置 AI”，再重新抓取题目。`);
+
+      if (!requiresGeneration) {
+        if (typeof onPersisted === 'function') await onPersisted({ ...changed, context });
+        return {
+          ...changed,
+          generated: null,
+          localOnly,
+          draftCreated: type === 'add',
+          completedNewCase,
+          scaffoldMayNeedRewrite: !localOnly && editedExistingCase
+        };
       }
-      const generated = await generateTestScaffold(context, changed.testCases, { type, testCase: affected });
-      return { ...changed, generated };
-    } catch (error) {
-      // The testcase change is already durable. Preserve it and mark the
-      // scaffold stale so the user can retry by re-capturing the problem,
-      // without losing work or accidentally running old code.
-      const detail = error?.message || '未知错误。';
-      outputChannel?.appendLine(`Testcase scaffold update failed after saving testcase data: ${detail}`);
-      const failedMetadata = {
-        ...context.metadata,
-        testcaseScaffoldStale: true,
-        testcaseScaffoldError: detail
-      };
-      await writeTextAtomically(path.join(context.folder, 'metadata.json'), JSON.stringify(failedMetadata, null, 2)).catch((writeError) => {
-        outputChannel?.appendLine(`Could not persist testcase scaffold failure state: ${writeError.message}`);
-      });
-      throw new Error(`测试用例已保存，但测试脚手架更新失败。请重新抓取题目后重试。原因：${detail}`);
-    }
+
+      // A newly completed case or a deleted scaffolded case changes the
+      // runner contract. Mark the old main stale before making the provider
+      // request so it cannot be run after a crash or failed generation.
+      if (!metadataMarkedStale) await markScaffoldStale(context);
+      beginTestcaseAiJob(identityKey);
+      aiJobStarted = true;
+      if (typeof onPersisted === 'function') await onPersisted({ ...changed, context });
+
+      try {
+        requireTrustedWorkspace('更新');
+        const ai = await configuredAiState();
+        if (!ai.configured) {
+          throw new Error(`未配置 ${providerInfo(ai.provider).label} API Key，无法更新测试脚手架。请先点击“配置 AI”。`);
+        }
+        const operationType = completedNewCase ? 'add' : 'delete';
+        const generated = await generateTestScaffold(
+          context,
+          changed.testCases,
+          { type: operationType, testCase: affected }
+        );
+        return { ...changed, generated, completedNewCase };
+      } catch (error) {
+        const detail = error?.message || '未知错误。';
+        outputChannel?.appendLine(`Testcase scaffold update failed after saving testcase data: ${detail}`);
+        await markScaffoldStale(context, detail).catch((writeError) => {
+          outputChannel?.appendLine(`Could not persist testcase scaffold failure state: ${writeError.message}`);
+        });
+        throw new Error(`测试用例已保存，但测试脚手架更新失败。可点击“重新编写测试脚手架”重试。原因：${detail}`);
+      }
     });
   } finally {
-    if (!identity.localOnly) activeTestcaseAiJobs.delete(identityKey);
+    if (aiJobStarted) endTestcaseAiJob(identityKey);
+  }
+}
+
+async function regenerateTestScaffold(payload = {}) {
+  const identity = await activeProblemIdentity();
+  if (identity.localOnly) {
+    throw new Error('该 solution 没有私有题目信息，不能生成 main 测试代码。');
+  }
+  const identityKey = pathKey(identity.folder);
+  if (captureJobActiveForFolder(identity.folder) || activeTestcaseAiJobs.has(identityKey)) {
+    throw new Error('AI 正在提取测试用例或更新 main 测试代码，请等待完成后重试。');
+  }
+  beginTestcaseAiJob(identityKey);
+  try {
+    return await withProblemLock(identity.folder, async () => {
+      let context = await problemContextFromIdentity(identity);
+      assertSidebarProblem(context, payload?.problemKey);
+      if (context.metadata?.testcaseExtraction?.status === 'pending') {
+        throw new Error('AI 测试用例提取尚未完成，请等待后重试。');
+      }
+      context = await ensurePersistedTestCases(context);
+      if (!context.testCases.some(testcaseHasRunnableData)) {
+        throw new Error('请先至少填写并保存一个测试用例。');
+      }
+      const generated = await generateTestScaffold(context, context.testCases, { type: 'regenerate' });
+      clearRunResults(context.folder);
+      return { generated, context };
+    });
+  } finally {
+    endTestcaseAiJob(identityKey);
   }
 }
 
@@ -2035,104 +2229,37 @@ function sidebarResultsFromRun(testCases, rawResults, selectedName) {
       continue;
     }
     const outputsMatch = comparableOutput(actualOutput) === comparableOutput(testCase.expectedOutput);
-    // Some LeetCode problems legitimately have multiple valid outputs. The
-    // generated scaffold can apply the problem-specific semantic comparison,
-    // so its explicit boolean takes precedence; textual comparison remains a
-    // safe fallback and still drives the visible expected/actual difference.
-    const passed = typeof result.passed === 'boolean' ? result.passed : outputsMatch;
+    // The sidebar's currently saved expected output is authoritative. main may
+    // still contain an older expectation after a user edits a case without
+    // regenerating it, so its cached `passed` boolean must not override the
+    // comparison shown by the UI. `actual` always comes from main's runtime
+    // result protocol.
+    const passed = outputsMatch;
     results[testCase.id] = {
       status: passed ? 'passed' : 'failed',
       passed,
-      actualOutput,
-      different: !outputsMatch
+      actualOutput
     };
   }
   return results;
-}
-
-function runFailureDiagnostics(error, execution) {
-  const source = execution || error || {};
-  const code = String(error?.code || source.code || (execution ? 'RUNTIME_EXIT' : 'RUN_FAILED'));
-  return {
-    stage: code.startsWith('COMPILE_') ? 'compile' : 'run',
-    code,
-    message: String(error?.message || source.error || 'main 测试代码运行失败。').slice(0, 4_000),
-    exitCode: source.exitCode == null ? '' : String(source.exitCode),
-    signal: String(source.signal || ''),
-    stdout: String(source.stdout || '').slice(0, 12_000),
-    stderr: String(source.stderr || '').slice(0, 12_000)
-  };
-}
-
-function shouldRepairMainAfterFailure(error, execution) {
-  if (execution && execution.ok === false) return true;
-  return AI_REPAIRABLE_RUNNER_CODES.has(String(error?.code || ''));
-}
-
-function testcaseProtocolFailure(execution) {
-  const failedCases = Object.entries(execution?.results || {})
-    .filter(([, result]) => typeof result?.error === 'string' && result.error.trim())
-    .map(([name, result]) => `${name}: ${result.error.trim()}`);
-  if (!failedCases.length) return null;
-  const message = `main 测试代码报告运行错误：${failedCases.slice(0, 20).join('；')}`.slice(0, 4_000);
-  return Object.assign(new Error(message), {
-    code: 'CASE_RUNTIME_ERROR',
-    exitCode: execution?.exitCode,
-    signal: execution?.signal,
-    stdout: execution?.stdout,
-    stderr: execution?.stderr
-  });
-}
-
-async function repairMainAfterRunFailure(context, error, execution, expectedScaffoldHash) {
-  if (!shouldRepairMainAfterFailure(error, execution)) return null;
-  let ai;
-  try {
-    ai = await configuredAiState();
-  } catch (configurationError) {
-    outputChannel?.appendLine(`Could not read AI configuration for main repair: ${configurationError.message}`);
-    return null;
-  }
-  if (!ai.configured) return null;
-
-  const identityKey = pathKey(context.folder);
-  activeTestcaseAiJobs.add(identityKey);
-  setSidebarRuntime({ notice: 'main 测试代码运行出错，AI 正在根据报错修复…', error: '' });
-  void refreshSidebar();
-  try {
-    const generated = await generateTestScaffold(
-      context,
-      context.testCases,
-      {
-        type: 'repair',
-        diagnostics: runFailureDiagnostics(error, execution),
-        expectedScaffoldHash
-      }
-    );
-    outputChannel?.appendLine(`AI repaired ${path.basename(generated.destination)} after a local test failure.`);
-    return { repaired: true, generated, diagnostics: runFailureDiagnostics(error, execution) };
-  } catch (repairError) {
-    const original = error?.message || execution?.error || 'main 测试代码运行失败。';
-    throw new Error(`${original} AI 自动修复 main 失败：${repairError?.message || '未知错误。'}`);
-  } finally {
-    activeTestcaseAiJobs.delete(identityKey);
-  }
 }
 
 async function runTestsFromSidebar(mode, payload) {
   const identity = await activeProblemIdentity();
   return withProblemLock(identity.folder, async () => {
     const context = await problemContextFromIdentity(identity);
+    assertSidebarProblem(context, payload?.problemKey);
+    assertProblemAiIdle(context);
     if (context.localOnly) {
       throw new Error('该 solution 没有私有题目信息，不能运行测试。请从浏览器重新抓取题目后再试。');
     }
     requireTrustedWorkspace('运行');
     if (context.metadata?.testcaseScaffoldStale) {
-      throw new Error('测试脚手架需要更新。请重新抓取题目后再运行测试。');
+      throw new Error('测试脚手架需要更新。请点击“重新编写测试脚手架”后再运行。');
     }
     const scaffold = scaffoldFilePath(context);
     if (!await fileExists(scaffold)) {
-      throw new Error('尚未生成测试脚手架。请配置 API Key 后重新抓取题目。');
+      throw new Error('尚未生成测试脚手架。请配置 API Key、保存至少一个用例，然后点击“重新编写测试脚手架”。');
     }
     const solutionDocument = openTextDocument(context.solutionPath);
     const scaffoldDocument = openTextDocument(scaffold);
@@ -2152,11 +2279,15 @@ async function runTestsFromSidebar(mode, payload) {
     // `solution.*` and the AI-generated `main.*` live together in the visible
     // title directory, so language adapters can compile/import them without an
     // extra runtime copy.
-    const expectedScaffoldHash = await confirmScaffoldExecution(scaffold);
+    const [expectedScaffoldHash, expectedSolutionHash] = await Promise.all([
+      scaffoldExecutionFingerprint(scaffold),
+      fileExecutionFingerprint(context.solutionPath)
+    ]);
     const runnableCaseNames = context.testCases
       .filter(testcaseHasRunnableData)
       .map((testCase) => testCase.name);
     let execution;
+    let runError;
     try {
       execution = mode === 'case'
         ? await runSingleTestCase({
@@ -2164,38 +2295,62 @@ async function runTestsFromSidebar(mode, payload) {
           scaffoldPath: scaffold,
           solutionPath: context.solutionPath,
           expectedCaseNames: [selected.name],
-          expectedScaffoldHash
+          expectedScaffoldHash,
+          expectedSolutionHash
         }, selected.name)
         : await runAllTestCases({
           problemFolder: path.dirname(context.solutionPath),
           scaffoldPath: scaffold,
           solutionPath: context.solutionPath,
           expectedCaseNames: runnableCaseNames,
-          expectedScaffoldHash
+          expectedScaffoldHash,
+          expectedSolutionHash
         });
     } catch (error) {
-      const repair = await repairMainAfterRunFailure(context, error, null, expectedScaffoldHash);
-      if (repair?.repaired) {
-        return { context, execution: null, selectedName: selected?.name || '', repair, runError: error };
+      // A non-zero process may emit valid results for some cases before it
+      // stops. Keep those results visible while also reporting the exact-set
+      // protocol failure and original runtime diagnostic. Successful processes
+      // with a mismatched result set remain a hard scaffold error.
+      if (error?.execution?.ok === false) {
+        execution = {
+          ...error.execution,
+          error: [error.execution.error, error.message].filter(Boolean).join(' ')
+        };
+      } else {
+        runError = error;
       }
-      throw error;
     }
-    const reportedRuntimeFailure = testcaseProtocolFailure(execution);
-    let repair = null;
-    let repairError = null;
-    try {
-      repair = execution.ok === false
-        ? await repairMainAfterRunFailure(context, null, execution, expectedScaffoldHash)
-        : reportedRuntimeFailure
-          ? await repairMainAfterRunFailure(context, reportedRuntimeFailure, execution, expectedScaffoldHash)
-          : null;
-    } catch (error) {
-      // The process may already have emitted useful per-case results. Preserve
-      // them even when the follow-up provider request or validation fails.
-      repairError = error;
-    }
-    return { context, execution, selectedName: selected?.name || '', repair, repairError };
+    await assertRunInputsUnchanged(
+      context,
+      scaffold,
+      expectedSolutionHash,
+      expectedScaffoldHash
+    );
+    if (runError) throw runError;
+    return { context, execution, selectedName: selected?.name || '' };
   });
+}
+
+function runnerErrorMessage(error) {
+  const base = String(error?.message || '运行测试失败，请稍后重试。');
+  const details = [error?.stderr, error?.stdout]
+    .map((value) => String(value || '').trim())
+    .filter((value) => value && !base.includes(value));
+  return [base, ...details].join('\n').slice(0, 12_000);
+}
+
+function logRunnerError(error, message) {
+  outputChannel?.appendLine(`Sidebar test run failed: ${error?.stack || message}`);
+  const appendDiagnostic = (label, value) => {
+    const text = String(value || '').trim();
+    if (text) outputChannel?.appendLine(`${label}:\n${text.slice(0, 30_000)}`);
+  };
+  appendDiagnostic('stderr', error?.stderr);
+  appendDiagnostic('stdout', error?.stdout);
+  for (const step of Array.isArray(error?.compileSteps) ? error.compileSteps : []) {
+    appendDiagnostic(`${step.label || 'compile'} stderr`, step.stderr);
+    appendDiagnostic(`${step.label || 'compile'} stdout`, step.stdout);
+  }
 }
 
 async function runSidebarTests(mode, payload) {
@@ -2215,39 +2370,38 @@ async function runSidebarTests(mode, payload) {
   });
   try {
     const result = await runTestsFromSidebar(mode, payload);
-    if (result.repair?.repaired && !result.execution) {
-      setSidebarRuntime({
-        busy: false,
-        runBusy: false,
-        runningCaseId: '',
-        notice: 'main 测试代码运行失败；AI 已根据报错完成修复。请审阅更新后的 main，然后重新运行。',
-        error: ''
-      });
-      return refreshSidebar();
-    }
     const fresh = sidebarResultsFromRun(result.context.testCases, result.execution.results, result.selectedName);
     const merged = mode === 'case' && sidebarRuntime.resultFolder && pathKey(sidebarRuntime.resultFolder) === pathKey(result.context.folder)
       ? { ...sidebarRuntime.testResults, ...fresh }
       : fresh;
+    const caseErrors = Object.entries(result.execution.results || {})
+      .filter(([, value]) => typeof value?.error === 'string' && value.error.trim())
+      .map(([name, value]) => `${name}: ${value.error.trim()}`);
+    const executionError = result.execution.ok === false
+      ? (result.execution.error || '测试脚手架运行失败。')
+      : caseErrors.length
+        ? `测试代码报告错误：${caseErrors.slice(0, 20).join('；')}`
+        : '';
+    if (executionError) {
+      outputChannel?.appendLine(`Sidebar test execution error: ${executionError}`);
+      if (result.execution.stderr) outputChannel?.appendLine(result.execution.stderr);
+    }
     setSidebarRuntime({
       busy: false,
       runBusy: false,
       runningCaseId: '',
       testResults: merged,
       resultFolder: result.context.folder,
-      notice: result.repair?.repaired
-        ? '本次运行异常结束；已显示已返回的结果，AI 也已根据报错修复 main。请审阅后重新运行。'
-        : result.repairError
-        ? '本次运行异常结束；已显示已返回的结果，但 AI 自动修复未完成。'
-        : result.execution.ok
+      notice: result.execution.ok && !caseErrors.length
         ? (mode === 'case' ? '测试用例运行完成。' : '全部测试用例运行完成。')
-        : `测试脚手架异常结束；已显示已返回的测试结果。${result.execution.error ? ` ${result.execution.error}` : ''}`,
-      error: result.repairError?.message || ''
+        : '测试运行结束，已显示可用结果和错误信息。',
+      error: executionError
     });
     return refreshSidebar();
   } catch (error) {
-    const message = error?.message || '运行测试失败，请稍后重试。';
-    outputChannel?.appendLine(`Sidebar test run failed: ${error?.stack || message}`);
+    const message = runnerErrorMessage(error);
+    logRunnerError(error, message);
+    if (error?.code === 'RUN_INPUT_CHANGED') clearRunResults();
     setSidebarRuntime({ busy: false, runBusy: false, runningCaseId: '', notice: '', error: message });
     return refreshSidebar();
   }
@@ -2281,33 +2435,48 @@ async function runSidebarAction(startMessage, action, successMessage, { testcase
 
 function createSidebar() {
   const updateAfterPersist = () => refreshSidebar();
-  const mutationMessage = (result, action, testCase) => result.localOnly
-    ? `已${action} ${testCase.name}；该本地题目未关联私有题目信息，因此没有生成 main 测试代码。`
-    : `已${action} ${testCase.name}，并更新 main 测试代码。`;
+  const updateMessage = (result) => {
+    if (result.localOnly) return `已保存 ${result.testCase.name}；该本地题目不支持生成测试脚手架。`;
+    if (result.generated) return `已保存 ${result.testCase.name}，并生成最新的 main 测试代码。`;
+    if (result.scaffoldMayNeedRewrite) {
+      return `已保存 ${result.testCase.name}。用例内容已修改，现有 main 可能不再与之匹配；如有需要，请点击“重新编写测试脚手架”。`;
+    }
+    return `已保存 ${result.testCase.name}。`;
+  };
   return new LeetCodeCphSidebarProvider({
     onReady: () => refreshSidebar(),
     onDismissNotice: (payload) => dismissSidebarNotice(payload?.revision),
     onAdd: (payload) => runSidebarAction(
-      '正在保存测试用例并更新 main 测试代码…',
+      '正在新增空白测试用例…',
       () => mutateTestCaseAndScaffold('add', payload, updateAfterPersist),
-      (result) => mutationMessage(result, '新增', result.testCase),
+      (result) => result.localOnly
+        ? `已新增 ${result.testCase.name} 空白用例；填写后点击保存。该本地题目不支持生成或运行测试脚手架。`
+        : `已新增 ${result.testCase.name} 空白用例；填写后点击保存，届时才会让 AI 更新测试脚手架。`,
       { testcaseMutation: true }
     ),
     onUpdate: (payload) => runSidebarAction(
-      '正在保存测试用例并更新 main 测试代码…',
+      '正在保存测试用例…',
       () => mutateTestCaseAndScaffold('update', payload, updateAfterPersist),
-      (result) => mutationMessage(result, '更新', result.testCase),
+      updateMessage,
       { testcaseMutation: true }
     ),
     onDelete: (payload) => runSidebarAction(
       '正在删除测试用例并更新 main 测试代码…',
       () => mutateTestCaseAndScaffold('delete', payload, updateAfterPersist),
-      (result) => mutationMessage(result, '删除', result.deleted),
+      (result) => result.localOnly
+        ? `已删除 ${result.deleted.name}；该本地题目没有生成 main 测试代码。`
+        : `已删除 ${result.deleted.name}，并更新 main 测试代码。`,
       { testcaseMutation: true }
     ),
     onRunTestCase: (payload) => runSidebarTests('case', payload),
-    onRunAllTestCases: () => runSidebarTests('all'),
-    onSync: () => runSidebarAction('正在同步代码到 LeetCode…', () => syncActiveSolution(), (result) => result.duplicates ? `已同步到 LeetCode；另有 ${result.duplicates} 个同题标签未修改。` : '已同步代码到 LeetCode。'),
+    onRunAllTestCases: (payload) => runSidebarTests('all', payload),
+    onSync: (payload) => runSidebarAction('正在同步代码到 LeetCode…', () => syncActiveSolution(payload?.problemKey), (result) => result.duplicates ? `已同步到 LeetCode；另有 ${result.duplicates} 个同题标签未修改。` : '已同步代码到 LeetCode。'),
+    onRegenerate: (payload) => runSidebarAction(
+      'AI 正在重新编写 main 测试代码…',
+      () => regenerateTestScaffold(payload),
+      '已重新编写测试脚手架。',
+      { testcaseMutation: true }
+    ),
     onConfigure: () => runSidebarAction('正在配置 AI…', () => configureAi(), (result) => result ? `${providerInfo(result.provider).label} API Key 已安全保存。` : '已取消 AI 配置。'),
     onBugReport: () => runSidebarAction('正在打开 GitHub…', async () => {
       await vscode.env.openExternal(vscode.Uri.parse('https://github.com/dd1000001000/simple-leetcode-cph'));
@@ -2319,6 +2488,9 @@ function createSidebar() {
 function startServer() {
   const { port } = config();
   server = http.createServer((request, response) => {
+    if (!isCompanionExtensionRequest(request)) {
+      return respond(response, 403, { error: 'Forbidden client origin' });
+    }
     if (request.method === 'OPTIONS') return respond(response, 204, {});
     if (request.method !== 'POST' || request.url !== '/capture') return respond(response, 404, { error: 'Not found' });
     let raw = '';
@@ -2402,6 +2574,10 @@ async function handleSolutionRenames(event) {
       if (!isPathInside(oldPath, oldSolution)) continue;
       const relative = path.relative(path.resolve(oldPath), path.resolve(oldSolution));
       const rebasedSolution = relative ? path.resolve(newPath, relative) : path.resolve(newPath);
+      if (reservedSolutionFileName(rebasedSolution)) {
+        vscode.window.showWarningMessage('main.<语言> 和 testcase.<语言> 是测试入口保留名称，不能作为题目解答文件名。请将文件改回 solution.<语言>。');
+        continue;
+      }
       const targetWorkspace = workspaceFolderForPath(rebasedSolution);
       if (!targetWorkspace || path.extname(oldSolution).toLowerCase() !== path.extname(rebasedSolution).toLowerCase()) {
         vscode.window.showWarningMessage('题目解答移出当前工作区或更改语言后无法继续关联；请移回工作区、改回原后缀，或重新抓取题目。');
@@ -2422,15 +2598,20 @@ async function handleSolutionRenames(event) {
         const latestRelative = path.relative(path.resolve(oldPath), path.resolve(latestSolution));
         const latestRebased = latestRelative ? path.resolve(newPath, latestRelative) : path.resolve(newPath);
         const latestWorkspace = workspaceFolderForPath(latestRebased);
-        if (!latestWorkspace || path.extname(latestSolution).toLowerCase() !== path.extname(latestRebased).toLowerCase()) return;
+        if (!latestWorkspace || reservedSolutionFileName(latestRebased)
+          || path.extname(latestSolution).toLowerCase() !== path.extname(latestRebased).toLowerCase()) return;
         if (pathKey(latestSolution) !== pathKey(latestRebased) && await fileExists(latestSolution)) return;
+        const solutionFileRenamed = path.basename(latestSolution) !== path.basename(latestRebased);
         const next = {
           ...metadata,
           solutionPath: latestRebased,
           solutionRelativePath: path.relative(latestWorkspace.path, latestRebased),
           workspaceRootPath: latestWorkspace.path,
           workspaceFolderUri: latestWorkspace.uri,
-          solutionFileName: path.basename(latestRebased)
+          solutionFileName: path.basename(latestRebased),
+          testcaseScaffoldStale: solutionFileRenamed
+            ? true
+            : Boolean(metadata.testcaseScaffoldStale)
         };
         await writeTextAtomically(metadataPath, JSON.stringify(next, null, 2));
         solutionRecordCache.delete(pathKey(latestSolution));
@@ -2513,6 +2694,7 @@ function activate(context) {
 function deactivate() {
   clearInterval(heartbeatTimer);
   clearSidebarNoticeTimer();
+  sidebarRefreshEpoch += 1;
   applyTracker?.disposeAll('VS Code 扩展已停止。');
   sidebarProvider?.dispose();
   sidebarProvider = undefined;

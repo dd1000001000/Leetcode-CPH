@@ -40,14 +40,19 @@ test('sidebar provider renders a CSP-protected testcase UI', () => {
   assert.match(html, /\+新增测试用例/);
   assert.doesNotMatch(html, /id="case-input"/);
   assert.doesNotMatch(html, /id="case-output"/);
-  assert.match(html, /保存并更新/);
-  assert.doesNotMatch(html, /生成\/更新测试脚手架/);
+  assert.match(html, /className = 'small-button save-button'/);
+  assert.match(html, /save\.textContent = '保存'/);
+  assert.match(html, /className = 'collapse-button'/);
+  assert.match(html, /className = 'case-status '/);
+  assert.match(html, /className = 'runtime'/);
   assert.match(html, /运行全部测试用例/);
   assert.match(html, /实际输出/);
-  assert.match(html, /差异（预期 \/ 实际）/);
-  assert.match(html, /diff-row\.changed/);
-  assert.match(html, /editorWarning-foreground/);
+  assert.doesNotMatch(html, /差异（预期 \/ 实际）/);
+  assert.doesNotMatch(html, /appendOutputDiff/);
+  assert.doesNotMatch(html, /diff-row/);
   assert.match(html, /同步代码到 LeetCode/);
+  assert.match(html, /重新编写测试脚手架/);
+  assert.match(html, /postAction\('regenerateScaffold'\)/);
   assert.match(html, /配置 AI/);
   assert.match(html, /反馈 Bug/);
   assert.match(html, /id="notice-dismiss"/);
@@ -64,37 +69,40 @@ test('sidebar provider forwards manual testcase and sidebar actions', async () =
     onUpdate: (payload) => calls.push(['update', payload]),
     onDelete: (payload) => calls.push(['delete', payload]),
     onRunTestCase: (payload) => calls.push(['run', payload]),
-    onRunAllTestCases: () => calls.push(['run-all']),
-    onSync: () => calls.push(['sync']),
+    onRunAllTestCases: (payload) => calls.push(['run-all', payload]),
+    onSync: (payload) => calls.push(['sync', payload]),
+    onRegenerate: (payload) => calls.push(['regenerate', payload]),
     onConfigure: () => calls.push(['configure']),
     onBugReport: () => calls.push(['bug'])
   });
   provider.setState({
-    problem: { title: '1. Two Sum', language: 'C++', aiStatus: '已配置 GLM' },
+    problem: { key: 'problem-a', title: '1. Two Sum', language: 'C++', aiStatus: '已配置 GLM' },
     testCases: [{ id: 'tc-1', input: '[2,7], 9', expectedOutput: '[0,1]' }]
   });
   const view = makeView();
   provider.resolveWebviewView(view);
 
   await view.send({ type: 'ready' });
-  await view.send({ type: 'addTestCase', input: '1', expectedOutput: '1' });
-  await view.send({ type: 'updateTestCase', id: 7, input: '2', expectedOutput: '4' });
-  await view.send({ type: 'deleteTestCase', id: 7 });
-  await view.send({ type: 'runTestCase', id: 'tc-1' });
-  await view.send({ type: 'runAllTestCases' });
-  await view.send({ type: 'sync' });
+  await view.send({ type: 'addTestCase', problemKey: 'problem-a', input: '1', expectedOutput: '1' });
+  await view.send({ type: 'updateTestCase', id: 7, problemKey: 'problem-a', input: '2', expectedOutput: '4' });
+  await view.send({ type: 'deleteTestCase', id: 7, problemKey: 'problem-a' });
+  await view.send({ type: 'runTestCase', id: 'tc-1', problemKey: 'problem-a' });
+  await view.send({ type: 'runAllTestCases', problemKey: 'problem-a' });
+  await view.send({ type: 'sync', problemKey: 'problem-a' });
+  await view.send({ type: 'regenerateScaffold', problemKey: 'problem-a' });
   await view.send({ type: 'configureAI' });
   await view.send({ type: 'openBugReport' });
   await view.send({ type: 'dismissNotice', revision: 7 });
 
   assert.deepEqual(calls, [
     ['ready'],
-    ['add', {}],
-    ['update', { id: '7', input: '2', expectedOutput: '4' }],
-    ['delete', { id: '7' }],
-    ['run', { id: 'tc-1' }],
-    ['run-all'],
-    ['sync'],
+    ['add', { problemKey: 'problem-a' }],
+    ['update', { id: '7', problemKey: 'problem-a', input: '2', expectedOutput: '4' }],
+    ['delete', { id: '7', problemKey: 'problem-a' }],
+    ['run', { id: 'tc-1', problemKey: 'problem-a' }],
+    ['run-all', { problemKey: 'problem-a' }],
+    ['sync', { problemKey: 'problem-a' }],
+    ['regenerate', { problemKey: 'problem-a' }],
     ['configure'],
     ['bug'],
     ['dismiss-notice', { revision: 7 }]
@@ -155,7 +163,7 @@ test('sidebar ignores a duplicate action while the first action is still pending
   const duplicate = view.send({ type: 'addTestCase' });
   release();
   await Promise.all([first, duplicate]);
-  assert.deepEqual(calls, [{}]);
+  assert.deepEqual(calls, [{ problemKey: '' }]);
   provider.dispose();
 });
 

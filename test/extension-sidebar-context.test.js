@@ -51,6 +51,29 @@ function initializePrivateStorage(sandbox, storagePath) {
   assert.equal(initialized, path.resolve(storagePath));
 }
 
+test('overlapping testcase AI jobs retain busy ownership until every caller finishes', () => {
+  const sandbox = loadExtension({ workspace: { textDocuments: [] }, window: {} });
+  sandbox.testIdentityKey = path.resolve('shared-problem');
+  assert.equal(vm.runInContext(`
+    beginTestcaseAiJob(testIdentityKey);
+    beginTestcaseAiJob(testIdentityKey);
+    endTestcaseAiJob(testIdentityKey);
+    activeTestcaseAiJobs.has(testIdentityKey);
+  `, sandbox), true);
+  assert.equal(vm.runInContext(`
+    endTestcaseAiJob(testIdentityKey);
+    activeTestcaseAiJobs.has(testIdentityKey);
+  `, sandbox), false);
+});
+
+test('sidebar problem scope changes when the same private record is recaptured', () => {
+  const sandbox = loadExtension({ workspace: { textDocuments: [] }, window: {} });
+  const folder = path.resolve('same-private-record');
+  const first = sandbox.sidebarProblemKey({ folder, metadata: { captureRevision: 'revision-a' } });
+  const second = sandbox.sidebarProblemKey({ folder, metadata: { captureRevision: 'revision-b' } });
+  assert.notEqual(first, second);
+});
+
 test('sidebar notice expires after 15 seconds and stale dismissal cannot clear a newer notice', () => {
   const timers = [];
   const cleared = [];
@@ -195,7 +218,7 @@ test('sidebar never shows legacy raw DOM testcases after the AI-only migration',
   assert.deepEqual(Array.from(context.testCases, (item) => item.id), ['manual-kept']);
 });
 
-test('sidebar preserves a scaffold semantic pass while still flagging textual output differences', () => {
+test('sidebar uses the saved expected output for status and the runtime protocol for actual output', () => {
   const sandbox = loadExtension({});
   const results = sandbox.sidebarResultsFromRun([
     { id: 'case-1', name: 'testcase 001', input: 'nums=[2,7], target=9', expectedOutput: '[0,1]' }
@@ -204,10 +227,9 @@ test('sidebar preserves a scaffold semantic pass while still flagging textual ou
   });
 
   assert.deepEqual({ ...results['case-1'] }, {
-    status: 'passed',
-    passed: true,
-    actualOutput: '[1,0]',
-    different: true
+    status: 'failed',
+    passed: false,
+    actualOutput: '[1,0]'
   });
 });
 
@@ -790,6 +812,54 @@ test('a delayed rename event cannot redirect a newer capture to the old renamed 
   assert.equal(await fs.readFile(renamedSolution, 'utf8'), 'old_browser_code = True\n');
 });
 
+test('renaming a solution to the reserved main filename never associates or overwrites it', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-reserved-main-rename-workspace-'));
+  const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-reserved-main-rename-storage-'));
+  temporaryFolders.push(root, storage);
+  const warnings = [];
+  const vscodeStub = {
+    workspace: {
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'outputDirectory' ? 'leetcode' : key === 'openSolutionAfterCapture' ? false : 27121 })
+    },
+    window: {
+      showTextDocument: async () => {},
+      showWarningMessage: (message) => { warnings.push(message); }
+    }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  initializePrivateStorage(sandbox, storage);
+  vm.runInContext('outputChannel = { appendLine() {} };', sandbox);
+  const saved = await sandbox.saveCapture({
+    title: 'Reserved Rename', source: 'https://leetcode.com/problems/reserved-rename/', problemSlug: 'reserved-rename',
+    language: 'Python3', description: '', samples: '', code: 'user_answer = True\n'
+  });
+  const mainPath = path.join(path.dirname(saved.solution), 'main.py');
+  await fs.rm(mainPath, { force: true });
+  await fs.rename(saved.solution, mainPath);
+  await sandbox.handleSolutionRenames({
+    files: [{
+      oldUri: { scheme: 'file', fsPath: saved.solution },
+      newUri: { scheme: 'file', fsPath: mainPath }
+    }]
+  });
+
+  const metadata = JSON.parse(await fs.readFile(path.join(saved.problemFolder, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.solutionPath, saved.solution);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), 'user_answer = True\n');
+  assert.ok(warnings.some((message) => message.includes('保留名称')));
+  await assert.rejects(
+    sandbox.generateTestScaffold({
+      folder: saved.problemFolder,
+      solutionPath: mainPath,
+      metadata: { title: 'Reserved Rename', source: 'https://leetcode.com/problems/reserved-rename/' },
+      code: 'user_answer = True\n'
+    }, [{ id: 'manual-1', name: 'testcase 001', input: 'x = 1', expectedOutput: '1' }], { type: 'regenerate' }),
+    /已拒绝覆盖/
+  );
+  assert.equal(await fs.readFile(mainPath, 'utf8'), 'user_answer = True\n');
+});
+
 test('background AI generation follows a solution rename recorded after capture', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-ai-rename-workspace-'));
   const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-ai-rename-storage-'));
@@ -861,6 +931,22 @@ test('background AI generation follows a solution rename recorded after capture'
   const reloadedContext = await reloaded.activeProblemContext();
   assert.equal(reloadedContext.solutionPath, renamedSolution);
   assert.equal(reloadedContext.folder, saved.problemFolder);
+
+  // Opening the renamed solution itself must also work after a restart. The
+  // previous host's cache is deliberately absent in this sandbox.
+  const reloadedFromSolution = loadExtension({
+    workspace: {
+      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }], rootPath: root, textDocuments: [],
+      getConfiguration: () => ({ get: () => undefined })
+    },
+    window: {
+      activeTextEditor: { document: { uri: { scheme: 'file', fsPath: renamedSolution }, getText: () => payload.code } }
+    }
+  });
+  initializePrivateStorage(reloadedFromSolution, storage);
+  const renamedContext = await reloadedFromSolution.activeProblemContext();
+  assert.equal(renamedContext.solutionPath, renamedSolution);
+  assert.equal(renamedContext.folder, saved.problemFolder);
 });
 
 test('re-capturing rejects a dirty local solution without changing any file', async () => {
@@ -993,7 +1079,7 @@ test('AI generation never overwrites main when it changes while the model reques
   await assert.rejects(fs.access(path.join(folder, 'main.py.bak')), { code: 'ENOENT' });
 });
 
-test('a manual blank case is saved without an API key and leaves the scaffold pending', async () => {
+test('a manual blank case is saved without an API key without invoking AI or making the scaffold stale', async () => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-manual-no-key-'));
   temporaryFolders.push(folder);
   const solutionPath = path.join(folder, 'solution.py');
@@ -1014,22 +1100,202 @@ test('a manual blank case is saved without an API key and leaves the scaffold pe
     }
   };
   const sandbox = loadExtension(vscodeStub);
+  let generateCalls = 0;
   sandbox.injectedAiService = {
-    async getConfiguredProviders() { return { glm: false, deepseek: false, qwen: false }; }
+    async getConfiguredProviders() { return { glm: false, deepseek: false, qwen: false }; },
+    async generateScaffold() { generateCalls += 1; throw new Error('AI must not run for a blank draft'); }
   };
   vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
 
-  await assert.rejects(
-    sandbox.mutateTestCaseAndScaffold('add', {}),
-    /测试用例已保存.*未配置 GLM API Key/
-  );
+  const added = await sandbox.mutateTestCaseAndScaffold('add', {});
+  assert.equal(added.generated, null);
+  assert.equal(added.draftCreated, true);
+  assert.equal(generateCalls, 0);
   const stored = JSON.parse(await fs.readFile(path.join(folder, 'testcases.json'), 'utf8'));
   assert.deepEqual(stored.testCases.map((testCase) => ({ source: testCase.source, input: testCase.input, expectedOutput: testCase.expectedOutput })), [
     { source: 'manual', input: '', expectedOutput: '' }
   ]);
   const metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
-  assert.equal(metadata.testcaseScaffoldStale, true);
-  assert.match(metadata.testcaseScaffoldError, /未配置 GLM API Key/);
+  assert.notEqual(metadata.testcaseScaffoldStale, true);
+  assert.equal(metadata.testcaseScaffoldError, undefined);
+});
+
+test('blank add waits for first save, later edits are save-only, and delete regenerates the scaffold', async () => {
+  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-manual-mutation-sequence-'));
+  temporaryFolders.push(folder);
+  const solutionPath = path.join(folder, 'solution.py');
+  const mainPath = path.join(folder, 'main.py');
+  await Promise.all([
+    fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
+    fs.writeFile(mainPath, '# original main\n', 'utf8'),
+    fs.writeFile(path.join(folder, 'metadata.json'), JSON.stringify({
+      title: 'Mutation Sequence',
+      source: 'https://leetcode.com/problems/mutation-sequence/',
+      language: 'Python3',
+      testcaseScaffoldStale: false
+    }), 'utf8')
+  ]);
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: {
+      activeTextEditor: {
+        document: { uri: { scheme: 'file', fsPath: solutionPath }, getText: () => 'class Solution: pass\n' }
+      }
+    }
+  };
+  const sandbox = loadExtension(vscodeStub);
+  const generationRequests = [];
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async generateScaffold(request) {
+      generationRequests.push(request);
+      return {
+        content: `# generated for ${request.operation.type}\n`,
+        provider: 'glm',
+        model: 'glm-5.2'
+      };
+    }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+
+  await assert.rejects(
+    sandbox.mutateTestCaseAndScaffold('add', { problemKey: 'stale-sidebar-problem' }),
+    /已切换到另一道题/
+  );
+  assert.equal(generationRequests.length, 0);
+
+  const added = await sandbox.mutateTestCaseAndScaffold('add', {
+    input: 'this payload must be ignored',
+    expectedOutput: 'this payload must be ignored'
+  });
+  assert.equal(added.testCase.input, '');
+  assert.equal(added.testCase.expectedOutput, '');
+  assert.equal(added.generated, null);
+  assert.equal(generationRequests.length, 0);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# original main\n');
+
+  const firstSave = await sandbox.mutateTestCaseAndScaffold('update', {
+    id: added.testCase.id,
+    input: 'x = 1',
+    expectedOutput: '1'
+  });
+  assert.equal(firstSave.completedNewCase, true);
+  assert.equal(generationRequests.length, 1);
+  assert.equal(generationRequests[0].operation.type, 'add');
+  assert.equal(generationRequests[0].operation.testCase.id, added.testCase.id);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# generated for add\n');
+
+  const laterEdit = await sandbox.mutateTestCaseAndScaffold('update', {
+    id: added.testCase.id,
+    input: 'x = 2',
+    expectedOutput: '2'
+  });
+  assert.equal(laterEdit.generated, null);
+  assert.equal(laterEdit.scaffoldMayNeedRewrite, true);
+  assert.equal(generationRequests.length, 1);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# generated for add\n');
+  let metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.testcaseScaffoldStale, false);
+  const persistedAfterEdit = JSON.parse(await fs.readFile(path.join(folder, 'testcases.json'), 'utf8'));
+  assert.equal(persistedAfterEdit.testCases[0].input, 'x = 2');
+  assert.equal(persistedAfterEdit.testCases[0].expectedOutput, '2');
+  assert.equal(persistedAfterEdit.testCases[0].pendingScaffold, false);
+
+  const clearedEdit = await sandbox.mutateTestCaseAndScaffold('update', {
+    id: added.testCase.id,
+    input: '',
+    expectedOutput: ''
+  });
+  assert.equal(clearedEdit.scaffoldMayNeedRewrite, true);
+  const refilledEdit = await sandbox.mutateTestCaseAndScaffold('update', {
+    id: added.testCase.id,
+    input: 'x = 3',
+    expectedOutput: '3'
+  });
+  assert.equal(refilledEdit.completedNewCase, false, 'refilling a cleared existing case is still an edit');
+  assert.equal(refilledEdit.scaffoldMayNeedRewrite, true);
+  assert.equal(generationRequests.length, 1, 'later edits must not call AI even after temporarily clearing the case');
+
+  const deleted = await sandbox.mutateTestCaseAndScaffold('delete', { id: added.testCase.id });
+  assert.equal(deleted.testCases.length, 0);
+  assert.equal(generationRequests.length, 2);
+  assert.equal(generationRequests[1].operation.type, 'delete');
+  assert.equal(generationRequests[1].operation.testCase.id, added.testCase.id);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), '# generated for delete\n');
+  metadata = JSON.parse(await fs.readFile(path.join(folder, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.testcaseScaffoldStale, false);
+});
+
+test('a first-save metadata failure leaves the empty draft unchanged and does not call AI', async () => {
+  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-first-save-stale-failure-'));
+  temporaryFolders.push(folder);
+  const solutionPath = path.join(folder, 'solution.py');
+  const metadataPath = path.join(folder, 'metadata.json');
+  await Promise.all([
+    fs.writeFile(solutionPath, 'class Solution: pass\n', 'utf8'),
+    fs.writeFile(path.join(folder, 'main.py'), '# existing main\n', 'utf8'),
+    fs.writeFile(metadataPath, JSON.stringify({
+      title: 'Atomic First Save',
+      source: 'https://leetcode.com/problems/atomic-first-save/',
+      language: 'Python3',
+      testcaseScaffoldStale: false
+    }), 'utf8')
+  ]);
+
+  let failNextMetadataRename = false;
+  const failingFs = Object.create(fs);
+  failingFs.rename = async (from, to) => {
+    if (failNextMetadataRename && path.resolve(String(to)) === path.resolve(metadataPath)) {
+      failNextMetadataRename = false;
+      const error = new Error('injected stale metadata failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return fs.rename(from, to);
+  };
+  const vscodeStub = {
+    workspace: {
+      isTrusted: true,
+      textDocuments: [],
+      getConfiguration: () => ({ get: (key) => key === 'ai.provider' ? 'glm' : '' })
+    },
+    window: {
+      activeTextEditor: {
+        document: { uri: { scheme: 'file', fsPath: solutionPath }, getText: () => 'class Solution: pass\n' }
+      }
+    }
+  };
+  const sandbox = loadExtension(vscodeStub, { fsPromises: failingFs });
+  let aiCalls = 0;
+  sandbox.injectedAiService = {
+    async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
+    async generateScaffold() { aiCalls += 1; return { content: '# should not be written\n', provider: 'glm', model: 'glm-5.2' }; }
+  };
+  vm.runInContext('aiTestcaseService = injectedAiService; outputChannel = { appendLine() {} };', sandbox);
+
+  const added = await sandbox.mutateTestCaseAndScaffold('add', {});
+  failNextMetadataRename = true;
+  await assert.rejects(
+    sandbox.mutateTestCaseAndScaffold('update', {
+      id: added.testCase.id,
+      input: 'x = 1',
+      expectedOutput: '1'
+    }),
+    /injected stale metadata failure/
+  );
+
+  const state = JSON.parse(await fs.readFile(path.join(folder, 'testcases.json'), 'utf8'));
+  assert.equal(state.testCases.length, 1);
+  assert.equal(state.testCases[0].input, '');
+  assert.equal(state.testCases[0].expectedOutput, '');
+  assert.equal(state.testCases[0].pendingScaffold, true);
+  const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  assert.equal(metadata.testcaseScaffoldStale, false);
+  assert.equal(aiCalls, 0);
 });
 
 test('an unlinked solution supports manual cases but never AI, execution, or URL-less sync', async () => {
@@ -1089,19 +1355,15 @@ test('an unlinked solution supports manual cases but never AI, execution, or URL
   await assert.rejects(fs.access(path.join(problemDirectory, 'main.py')), { code: 'ENOENT' });
 });
 
-test('a repairable main failure sends diagnostics and existing code to AI, then replaces main with a backup', async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-main-repair-workspace-'));
-  const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-main-repair-storage-'));
+test('run failures are reported without confirmation or AI rewriting, while explicit regeneration remains available', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-no-auto-repair-workspace-'));
+  const storage = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-no-auto-repair-storage-'));
   temporaryFolders.push(root, storage);
   const runner = require('../vscode-extension/testcase-runner');
-  const compileFailure = Object.assign(new Error('main 编译失败'), {
-    code: 'COMPILE_FAILED',
-    exitCode: 1,
-    stdout: '',
-    stderr: 'main.py:7: invalid syntax'
-  });
   let runnerMode = 'compile';
-  let runtimeMainPath = '';
+  let runtimeSolutionPath = '';
+  let warningCalls = 0;
+  const outputLines = [];
   const textDocuments = [];
   const vscodeStub = {
     workspace: {
@@ -1113,28 +1375,53 @@ test('a repairable main failure sends diagnostics and existing code to AI, then 
     },
     window: {
       showTextDocument: async () => {},
-      showWarningMessage: async () => '我已审阅，运行'
+      showWarningMessage: async () => {
+        warningCalls += 1;
+        throw new Error('running tests must not ask for scaffold review');
+      }
     },
     Uri: { file: (value) => ({ scheme: 'file', fsPath: value }) }
   };
+  const compileFailure = Object.assign(
+    new Error('main 编译失败（退出码 1）。 main.py:7: invalid syntax'),
+    { code: 'COMPILE_FAILED', exitCode: 1, stdout: '', stderr: 'main.py:7: invalid syntax' }
+  );
   const sandbox = loadExtension(vscodeStub, {
     testcaseRunner: {
       ...runner,
       runAllTestCases: async () => {
-        if (runnerMode === 'compile') throw compileFailure;
-        if (runnerMode === 'race') {
-          await fs.writeFile(runtimeMainPath, '# user saved a newer main after execution started\n', 'utf8');
+        if (runnerMode === 'change-success') {
+          await fs.writeFile(runtimeSolutionPath, 'class Solution: changed during run\n', 'utf8');
+          return {
+            ok: true,
+            results: { 'testcase 001': { name: 'testcase 001', actual: 1, passed: true } },
+            stdout: '', stderr: '', error: '', exitCode: 0, signal: null
+          };
         }
-        const protocolLine = '__LEETCODE_CPH_RESULT__' + JSON.stringify({
-          name: 'testcase 001', actual: null, error: 'TypeError: adapter invocation failed'
-        });
+        if (runnerMode === 'change-error') {
+          await fs.writeFile(runtimeSolutionPath, 'class Solution: changed before failure\n', 'utf8');
+          throw compileFailure;
+        }
+        if (runnerMode === 'compile') throw compileFailure;
+        if (runnerMode === 'runtime') {
+          return {
+            ok: false,
+            results: { 'testcase 001': { name: 'testcase 001', actual: 0, passed: false } },
+            stdout: '',
+            stderr: 'runtime stack trace',
+            error: '测试脚手架运行失败（退出码 1）。 runtime stack trace',
+            exitCode: 1,
+            signal: null
+          };
+        }
         return {
           ok: true,
           results: {
             'testcase 001': { name: 'testcase 001', actual: null, error: 'TypeError: adapter invocation failed' }
           },
-          stdout: protocolLine + '\n',
+          stdout: '',
           stderr: 'adapter stack trace',
+          error: '',
           exitCode: 0,
           signal: null
         };
@@ -1142,15 +1429,17 @@ test('a repairable main failure sends diagnostics and existing code to AI, then 
     }
   });
   initializePrivateStorage(sandbox, storage);
-  vm.runInContext('outputChannel = { appendLine() {} };', sandbox);
+  sandbox.injectedOutputChannel = { appendLine: (line) => outputLines.push(String(line)) };
+  vm.runInContext('outputChannel = injectedOutputChannel;', sandbox);
   const saved = await sandbox.saveCapture({
-    title: 'Repair Me', source: 'https://leetcode.com/problems/repair-me/', problemSlug: 'repair-me',
+    title: 'No Auto Repair', source: 'https://leetcode.com/problems/no-auto-repair/', problemSlug: 'no-auto-repair',
     language: 'Python3', description: '', samples: '', code: 'class Solution: pass\n'
   });
+  runtimeSolutionPath = saved.solution;
   const oldMain = "# broken main\nprint('__LEETCODE_CPH_RESULT__')\n";
-  const fixedMain = "# fixed main\nprint('__LEETCODE_CPH_RESULT__' + '{\"name\":\"testcase 001\",\"actual\":1,\"passed\":true}')\n";
-  runtimeMainPath = path.join(path.dirname(saved.solution), 'main.py');
-  await fs.writeFile(runtimeMainPath, oldMain, 'utf8');
+  const regeneratedMain = "# explicitly regenerated main\nprint('__LEETCODE_CPH_RESULT__')\n";
+  const mainPath = path.join(path.dirname(saved.solution), 'main.py');
+  await fs.writeFile(mainPath, oldMain, 'utf8');
   await fs.writeFile(path.join(saved.problemFolder, 'testcases.json'), JSON.stringify({
     version: 3,
     testCases: [{
@@ -1174,60 +1463,63 @@ test('a repairable main failure sends diagnostics and existing code to AI, then 
   textDocuments.push(solutionDocument);
   vscodeStub.window.activeTextEditor = { document: solutionDocument };
 
-  let repairRequest;
-  let repairCalls = 0;
-  let aiMode = 'success';
+  let aiCalls = 0;
+  let regenerationRequest;
   sandbox.injectedAiService = {
     async getConfiguredProviders() { return { glm: true, deepseek: false, qwen: false }; },
     async generateScaffold(request) {
-      repairCalls += 1;
-      repairRequest = request;
-      if (aiMode === 'failure') throw new Error('provider unavailable');
-      return { content: fixedMain, provider: 'glm', model: 'glm-5.2' };
+      aiCalls += 1;
+      regenerationRequest = request;
+      return { content: regeneratedMain, provider: 'glm', model: 'glm-5.2' };
     }
   };
   vm.runInContext('aiTestcaseService = injectedAiService;', sandbox);
 
-  const result = await sandbox.runTestsFromSidebar('all');
+  const compileState = await sandbox.runSidebarTests('all');
+  assert.match(compileState.error, /invalid syntax/);
+  assert.equal(aiCalls, 0);
+  assert.equal(warningCalls, 0);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), oldMain);
 
-  assert.equal(result.execution, null);
-  assert.equal(result.repair.repaired, true);
-  assert.equal(repairRequest.operation.type, 'repair');
-  assert.equal(repairRequest.operation.diagnostics.code, 'COMPILE_FAILED');
-  assert.match(repairRequest.operation.diagnostics.stderr, /invalid syntax/);
-  assert.equal(repairRequest.existingScaffold, oldMain);
-  assert.equal(await fs.readFile(path.join(path.dirname(saved.solution), 'main.py'), 'utf8'), fixedMain);
-  assert.equal(await fs.readFile(path.join(saved.problemFolder, 'main.py.bak'), 'utf8'), oldMain);
-  assert.equal((await sandbox.sidebarState()).problem.aiBusy, false);
+  runnerMode = 'runtime';
+  const runtimeState = await sandbox.runSidebarTests('all');
+  assert.match(runtimeState.error, /runtime stack trace/);
+  assert.equal(runtimeState.testResults['manual-1'].actualOutput, '0');
+  assert.equal(aiCalls, 0);
+  assert.equal(warningCalls, 0);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), oldMain);
 
   runnerMode = 'protocol';
-  repairRequest = null;
-  const protocolResult = await sandbox.runTestsFromSidebar('all');
-  assert.equal(protocolResult.execution.ok, true);
-  assert.equal(protocolResult.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
-  assert.equal(protocolResult.repair.repaired, true);
-  assert.equal(repairRequest.operation.type, 'repair');
-  assert.equal(repairRequest.operation.diagnostics.code, 'CASE_RUNTIME_ERROR');
-  assert.match(repairRequest.operation.diagnostics.message, /adapter invocation failed/);
-  assert.match(repairRequest.operation.diagnostics.stderr, /adapter stack trace/);
-  assert.equal(repairRequest.existingScaffold, fixedMain);
+  const protocolState = await sandbox.runSidebarTests('all');
+  assert.match(protocolState.error, /adapter invocation failed/);
+  assert.equal(protocolState.testResults['manual-1'].actualOutput, 'null');
+  assert.equal(protocolState.testResults['manual-1'].status, 'error');
+  assert.equal(aiCalls, 0);
+  assert.equal(warningCalls, 0);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), oldMain);
+  assert.ok(outputLines.some((line) => line.includes('adapter stack trace')));
 
-  aiMode = 'failure';
-  const failedRepair = await sandbox.runTestsFromSidebar('all');
-  assert.equal(failedRepair.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
-  assert.equal(failedRepair.repair, null);
-  assert.match(failedRepair.repairError.message, /provider unavailable/);
-  assert.equal(await fs.readFile(runtimeMainPath, 'utf8'), fixedMain);
+  runnerMode = 'change-success';
+  const changedDuringSuccess = await sandbox.runSidebarTests('all');
+  assert.match(changedDuringSuccess.error, /运行期间 solution 或 main 已发生变化/);
+  assert.deepEqual(Object.keys(changedDuringSuccess.testResults), []);
+  assert.equal(aiCalls, 0);
+  await fs.writeFile(saved.solution, 'class Solution: pass\n', 'utf8');
 
-  aiMode = 'success';
-  runnerMode = 'race';
-  const repairCallsBeforeRace = repairCalls;
-  const staleFailure = await sandbox.runTestsFromSidebar('all');
-  assert.equal(staleFailure.execution.results['testcase 001'].error, 'TypeError: adapter invocation failed');
-  assert.equal(staleFailure.repair, null);
-  assert.match(staleFailure.repairError.message, /main 已发生变化/);
-  assert.equal(repairCalls, repairCallsBeforeRace, 'a newer main must not be sent to AI with stale diagnostics');
-  assert.equal(await fs.readFile(runtimeMainPath, 'utf8'), '# user saved a newer main after execution started\n');
+  runnerMode = 'change-error';
+  const changedDuringFailure = await sandbox.runSidebarTests('all');
+  assert.match(changedDuringFailure.error, /运行期间 solution 或 main 已发生变化/);
+  assert.deepEqual(Object.keys(changedDuringFailure.testResults), []);
+  assert.equal(aiCalls, 0);
+  await fs.writeFile(saved.solution, 'class Solution: pass\n', 'utf8');
+
+  const regenerated = await sandbox.regenerateTestScaffold();
+  assert.equal(aiCalls, 1);
+  assert.equal(regenerationRequest.operation.type, 'regenerate');
+  assert.equal(regenerated.generated.destination, mainPath);
+  assert.equal(await fs.readFile(mainPath, 'utf8'), regeneratedMain);
+  assert.equal(await fs.readFile(regenerated.generated.backup, 'utf8'), oldMain);
+  assert.equal(regenerated.generated.backup, path.join(saved.problemFolder, 'main.py.bak'));
 });
 
 test('capture defers remote AI extraction and scaffold generation until processCapturedAi', async () => {

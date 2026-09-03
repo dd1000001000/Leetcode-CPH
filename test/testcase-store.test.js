@@ -119,12 +119,15 @@ test('save/load, blank manual creation, and manual update keep stable testcase n
   const created = await createTestCase(folder, {}, options);
   assert.equal(created.testCase.name, 'testcase 002');
   assert.equal(created.testCase.source, 'manual');
+  assert.equal(created.testCase.pendingScaffold, true);
   assert.deepEqual({ input: created.testCase.input, expectedOutput: created.testCase.expectedOutput }, { input: '', expectedOutput: '' });
 
   const updated = await updateTestCase(folder, created.testCase.id, { input: 'n = 2', expectedOutput: '2' }, options);
   assert.equal(updated.testCase.name, 'testcase 002');
   assert.equal(updated.testCase.input, 'n = 2');
   assert.equal(updated.testCase.expectedOutput, '2');
+  assert.equal(updated.previous.pendingScaffold, true);
+  assert.equal(updated.testCase.pendingScaffold, false);
 
   const removed = await deleteTestCase(folder, created.testCase.id, options);
   assert.equal(removed.deleted.name, 'testcase 002');

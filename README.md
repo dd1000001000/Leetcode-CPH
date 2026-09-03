@@ -18,8 +18,9 @@ LeetCode CPH connects a browser extension with a VS Code extension so you can ca
 - Configure GLM, DeepSeek, or Qwen. API keys are saved in VS Code's secure Secret Storage.
 - Use the configured AI to extract test cases from the captured problem. Without an API key, the extension does not automatically extract or generate any test cases.
 - View, add, edit, and delete cases such as `testcase 001` and `testcase 002` in the Chinese VS Code sidebar UI.
-- Automatically update `main.<ext>` whenever a registered test case is added, edited, or deleted. Test-case editing controls are locked while AI extraction or scaffold generation is in progress.
-- Run one case or all cases from the sidebar. Each result shows expected and actual output; differing output lines are highlighted in yellow.
+- Create a blank case with one click. AI updates `main.<ext>` only when that new case is filled and saved, or when a case is deleted. Editing an existing case only saves the data and shows a reminder that the scaffold may need to be regenerated.
+- Regenerate `main.<ext>` at any time with **重新编写测试脚手架**. Test-case controls are locked while AI extraction or scaffold generation is in progress.
+- Run one case or all cases directly from the sidebar. Each card shows its status, expected output, and the actual output returned by `main.<ext>`.
 - Sync the current `solution.<ext>` code to the matching open LeetCode page with the sidebar button. The former Command Palette sync command is no longer used.
 - Open the project's GitHub issue page from the sidebar.
 
@@ -37,6 +38,7 @@ LeetCode CPH requires both the browser extension and the VS Code extension.
 4. Choose this repository's [`edge-extension`](./edge-extension) folder.
 
 If you use an InPrivate window, open the extension details and enable **Allow in InPrivate**.
+When upgrading an older unpacked copy, select **Reload**. If VS Code still reports that the browser extension is disconnected, remove the old unpacked entry and load this folder again once.
 
 ### Install the VS Code extension
 
@@ -44,13 +46,13 @@ If you already have a `.vsix` package:
 
 1. Open the **Extensions** view in VS Code.
 2. Select `...` and then **Install from VSIX...**.
-3. Choose `leetcode-cph-receiver-0.6.1.vsix` (or the newer package you built).
+3. Choose `leetcode-cph-receiver-0.7.0.vsix` (or the newer package you built).
 4. Reload VS Code after installation.
 
 You can also install it from a terminal:
 
 ```powershell
-code --install-extension .\vscode-extension\leetcode-cph-receiver-0.6.1.vsix
+code --install-extension .\vscode-extension\leetcode-cph-receiver-0.7.0.vsix
 ```
 
 To build the VSIX from source, run:
@@ -80,7 +82,8 @@ Capturing the same registered problem title again replaces its recorded solution
 1. Open the **LeetCode CPH** view in the VS Code Activity Bar.
 2. Select **配置 AI**, choose GLM, DeepSeek, or Qwen, and enter an API key.
 3. Capture the problem. The selected AI extracts grounded examples and creates `main.<ext>` beside `solution.<ext>`.
-4. Use **+新增测试用例** to create a blank case, edit its input and expected output, or delete an existing case. Each change asks the selected AI to update `main.<ext>`.
+4. Select **+新增测试用例** to create an empty card. Fill its input and expected output, then select **保存** in the card header. The first save generates the updated `main.<ext>`.
+5. Later edits to an existing case are saved without calling AI. The sidebar reminds you that you may need to select **重新编写测试脚手架**. Deleting a case updates the scaffold automatically.
 
 If no key is configured, capture still saves the problem and solution, but no cases or `main.<ext>` are generated automatically.
 
@@ -88,11 +91,11 @@ If no key is configured, capture still saves the problem and solution, but no ca
 
 - Select **运行** on a case to run only that case.
 - Select **运行全部测试用例** to run all cases.
-- Review expected and actual output in each card. Lines that differ are highlighted in yellow.
+- Review the status, expected output, and actual output in each card. Actual output always comes from the corresponding result emitted by `main.<ext>`.
 
-The generated `main.<ext>` is executable code. Run it only in a trusted workspace and inspect it before approval when prompted.
+The generated `main.<ext>` is executable code and can be run directly from the sidebar in a trusted workspace.
 
-If a generated `main.<ext>` fails with a repairable compile, runtime, or result-protocol error while the AI key is still configured, the extension asks the selected AI to repair it using the current solution, existing `main.<ext>`, all test cases, and sanitized, size-limited diagnostics. The replacement is validated and the previous `main.<ext>` is backed up. Tests are not rerun silently: review the updated file, then run them again yourself. A missing local compiler or runtime is a toolchain setup issue and does not trigger AI repair.
+Compile and runtime failures are shown in the sidebar and the LeetCode CPH output channel. A failed run never sends code to AI or rewrites `main.<ext>` automatically, because the failure may be in the solution rather than the scaffold. If the scaffold itself needs replacement, select **重新编写测试脚手架** yourself.
 
 ### 4. Sync to LeetCode
 

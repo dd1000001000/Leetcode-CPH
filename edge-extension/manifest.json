@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvSusYwdhThJqpOhI4AIbsPHJ7Fe9RjW1NnXFJ49mXAS0RDlqnB+OEn+B/b7oqe+Baw5kLfhtcImvKHgXGd+uQz5vmEl3sXCrHrjbgofOvJR8N0wRc6DPFYKJHwCkM4bGCCqLZ4Q+W8iLAvAb2GMFBX2N3Y/7U78z0vJrTCAxVFSueDLXkYmzDXRGmCO/QOaObIw9zpoJpb4WMDxdEZgfW1uH4TY9l7qTGeAgUM705zwO6Mt9VoSPsLIjwVP2ULuzR446DtPhzNto9++rcE8hJfThDlBtnUkP4GvSj1iFEdPwQpTgNsTS5B7j6wHScoktEotDKRwKZ5tOqkCH+Kg94wIDAQAB",
   "name": "LeetCode CPH Capture",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Capture the current LeetCode problem and editor code into VS Code.",
   "permissions": ["activeTab", "tabs", "scripting", "alarms"],
   "host_permissions": [

@@ -111,7 +111,7 @@ test('generation sends the chosen provider request and returns fence-free scaffo
   assert.equal(JSON.stringify(result).includes(apiKey), false);
 });
 
-test('scaffold prompt requires sibling main and solution files and never embeds a user path', async () => {
+test('scaffold prompt uses the metadata-recorded solution basename and never embeds a user path', async () => {
   const apiKey = 'runtime-contract-key';
   const userVisiblePath = 'C:\\Users\\Alice\\leetcode\\two-sum.py';
   const secrets = makeSecrets({ [secretKeyFor('glm')]: apiKey });
@@ -127,7 +127,7 @@ test('scaffold prompt requires sibling main and solution files and never embeds 
   await service.generateScaffold({
     metadata: {
       ...metadata,
-      runtimeSolutionFileName: 'solution.py',
+      runtimeSolutionFileName: 'answer.py',
       mainFileName: 'main.py',
       solutionPath: userVisiblePath
     },
@@ -137,10 +137,11 @@ test('scaffold prompt requires sibling main and solution files and never embeds 
     provider: 'glm'
   });
 
-  assert.match(prompt, /"runtimeSolutionFileName": "solution\.py"/);
+  assert.match(prompt, /"runtimeSolutionFileName": "answer\.py"/);
   assert.match(prompt, /"mainFileName": "main\.py"/);
-  assert.match(prompt, /same problem directory/i);
-  assert.match(prompt, /exact relative solution filename/i);
+  assert.match(prompt, /exact source basename/i);
+  assert.match(prompt, /Use that JSON value exactly/i);
+  assert.doesNotMatch(prompt, /Python main imports solution\.py normally/i);
   assert.match(prompt, /class LeetCodeCphTest/);
   assert.match(prompt, /object LeetCodeCphTest/);
   assert.match(prompt, /TypeScript solutionCode and main are concatenated/);
@@ -188,6 +189,30 @@ test('initialize generates one scaffold from all captured LeetCode examples with
 
   assert.equal(result.provider, 'qwen');
   assert.match(received.body.messages[1].content, /"type": "initialize"/);
+  assert.match(received.body.messages[1].content, /testcase 001/);
+  assert.match(received.body.messages[1].content, /testcase 002/);
+});
+
+test('regenerate rewrites the complete scaffold without requiring a synthetic testcase mutation', async () => {
+  const secrets = makeSecrets({ [secretKeyFor('glm')]: 'glm-key' });
+  let received;
+  const service = createAiTestcaseService({
+    secrets,
+    request: async (request) => { received = request; return successfulResponse(); }
+  });
+
+  const result = await service.generateScaffold({
+    metadata,
+    solutionCode: 'class Solution:\n    pass',
+    testCases,
+    operation: { type: 'regenerate' },
+    existingScaffold: '# outdated main',
+    provider: 'glm'
+  });
+
+  assert.equal(result.provider, 'glm');
+  assert.match(received.body.messages[1].content, /"type": "regenerate"/);
+  assert.match(received.body.messages[1].content, /rewrite the complete scaffold/i);
   assert.match(received.body.messages[1].content, /testcase 001/);
   assert.match(received.body.messages[1].content, /testcase 002/);
 });

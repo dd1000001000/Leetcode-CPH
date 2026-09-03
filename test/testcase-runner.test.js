@@ -301,13 +301,21 @@ test('uses a minimal execution environment rather than forwarding extension-host
   }
 });
 
-test('refuses to run a scaffold whose disk content changed after confirmation', async () => {
+test('refuses to run a scaffold whose disk content changed after the pre-run snapshot', async () => {
   const { folder, scaffoldPath } = await makeProblem("console.log('old scaffold');");
   const approvedHash = crypto.createHash('sha256').update(await fs.readFile(scaffoldPath)).digest('hex');
   await fs.writeFile(scaffoldPath, "console.log('replacement scaffold');", 'utf8');
   await assert.rejects(
     runAllTestCases({ problemFolder: folder, scaffoldPath, expectedScaffoldHash: approvedHash }),
     assertRunnerError('SCAFFOLD_CHANGED')
+  );
+
+  const solutionPath = await writeRuntimeSource(folder, 'js', 'function answer() { return 1; }\n');
+  const solutionHash = crypto.createHash('sha256').update(await fs.readFile(solutionPath)).digest('hex');
+  await fs.writeFile(solutionPath, 'function answer() { return 2; }\n', 'utf8');
+  await assert.rejects(
+    runAllTestCases({ problemFolder: folder, scaffoldPath, solutionPath, expectedSolutionHash: solutionHash }),
+    assertRunnerError('SOLUTION_CHANGED')
   );
 });
 
@@ -397,6 +405,27 @@ test('runs a JavaScript scaffold once per selected case or all cases without a s
   assert.deepEqual({ ...one.results }, {
     'testcase 002': { name: 'testcase 002', actual: '42', passed: true }
   });
+});
+
+test('a renamed solution keeps its basename in the isolated runtime workspace', async () => {
+  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'leetcode-cph-renamed-runtime-'));
+  temporaryFolders.push(folder);
+  const solutionPath = path.join(folder, 'answer.js');
+  const scaffoldPath = path.join(folder, 'main.js');
+  await fs.writeFile(solutionPath, 'module.exports = () => 42;\n', 'utf8');
+  await fs.writeFile(scaffoldPath, [
+    "const solve = require('./answer');",
+    `console.log(${JSON.stringify(RESULT_MARKER)} + JSON.stringify({ name: 'testcase 001', actual: solve(), passed: true }));`
+  ].join('\n'), 'utf8');
+
+  const result = await runAllTestCases({
+    problemFolder: folder,
+    scaffoldPath,
+    solutionPath,
+    expectedCaseNames: ['testcase 001']
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.results['testcase 001'].actual, 42);
 });
 
 test('passes a hostile-looking testcase name as an argument rather than shell code', async () => {

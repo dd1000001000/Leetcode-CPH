@@ -16,10 +16,20 @@ const crypto = require('crypto');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'vscode-extension', 'extension.js'), 'utf8');
 const { ApplyTracker } = require('../vscode-extension/apply-tracker');
+const COMPANION_ORIGIN = 'chrome-extension://lenchpcbgdkafhhfoeobicafbfhgklna';
+
+function chromiumExtensionId(publicKey) {
+  const digest = crypto.createHash('sha256').update(Buffer.from(publicKey, 'base64')).digest().subarray(0, 16);
+  return [...digest]
+    .flatMap((byte) => [byte >> 4, byte & 0x0f])
+    .map((nibble) => 'abcdefghijklmnop'[nibble])
+    .join('');
+}
 
 function createSandbox() {
   const outputChannel = { appendLine() {} };
   const fakeServer = {
+    requestListener: undefined,
     on() { return fakeServer; },
     listen(_port, _host, callback) { if (callback) callback(); return fakeServer; },
     close(callback) { if (callback) callback(); return fakeServer; }
@@ -52,7 +62,7 @@ function createSandbox() {
     clearInterval,
     require: (name) => {
       if (name === 'vscode') return vscodeStub;
-      if (name === 'http') return { createServer: () => fakeServer };
+      if (name === 'http') return { createServer: (listener) => { fakeServer.requestListener = listener; return fakeServer; } };
       if (name === 'crypto') return crypto;
       if (name === 'path') return path;
       if (name === 'fs/promises') return require('fs/promises');
@@ -64,6 +74,7 @@ function createSandbox() {
       throw new Error(`Unexpected require: ${name}`);
     }
   };
+  sandbox.fakeServer = fakeServer;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'extension.js' });
   return sandbox;
@@ -99,7 +110,7 @@ test('write failure to a client settles its other pending apply immediately', as
     // Connect one browser client through the real WebSocket accept path.
     const socket = makeFakeSocket();
     sandbox.acceptWebSocket(
-      { url: '/ws', headers: { upgrade: 'websocket', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' } },
+      { url: '/ws', headers: { origin: COMPANION_ORIGIN, upgrade: 'websocket', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' } },
       socket
     );
 
@@ -120,4 +131,41 @@ test('write failure to a client settles its other pending apply immediately', as
   } finally {
     await sandbox.deactivate();
   }
+});
+
+test('receiver accepts only the fixed companion extension origin', async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'edge-extension', 'manifest.json'), 'utf8'));
+  assert.equal(`chrome-extension://${chromiumExtensionId(manifest.key)}`, COMPANION_ORIGIN);
+  const sandbox = createSandbox();
+  assert.equal(sandbox.isCompanionExtensionRequest({ headers: { origin: COMPANION_ORIGIN } }), true);
+  assert.equal(sandbox.isCompanionExtensionRequest({ headers: { origin: 'https://leetcode.com' } }), false);
+  assert.equal(sandbox.isCompanionExtensionRequest({ headers: {} }), false);
+
+  const hostileSocket = makeFakeSocket();
+  sandbox.acceptWebSocket(
+    {
+      url: '/ws',
+      headers: {
+        origin: 'https://attacker.example',
+        upgrade: 'websocket',
+        'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ=='
+      }
+    },
+    hostileSocket
+  );
+  assert.equal(hostileSocket.destroyed, true);
+  assert.equal(vm.runInContext('socketClients.size', sandbox), 0);
+
+  sandbox.activate({ subscriptions: { push() {} } });
+  const responseState = {};
+  sandbox.fakeServer.requestListener(
+    { method: 'POST', url: '/capture', headers: { origin: 'https://attacker.example' } },
+    {
+      writeHead(status, headers) { responseState.status = status; responseState.headers = headers; },
+      end(body) { responseState.body = body; }
+    }
+  );
+  assert.equal(responseState.status, 403);
+  assert.match(responseState.body, /Forbidden client origin/);
+  await sandbox.deactivate();
 });

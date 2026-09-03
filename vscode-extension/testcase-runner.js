@@ -599,9 +599,34 @@ function validateExpectedScaffoldHash(value) {
   if (value === undefined || value === null || value === '') return '';
   const hash = String(value).toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(hash)) {
-    throw runnerError('测试脚手架校验摘要无效。请重新确认后再运行。', 'INVALID_SCAFFOLD_HASH');
+    throw runnerError('测试脚手架校验摘要无效。请重新运行。', 'INVALID_SCAFFOLD_HASH');
   }
   return hash;
+}
+
+function validateExpectedSolutionHash(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const hash = String(value).toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(hash)) {
+    throw runnerError('解答代码校验摘要无效。请重新运行。', 'INVALID_SOLUTION_HASH');
+  }
+  return hash;
+}
+
+async function assertExpectedSolutionHash(solutionPath, expectedHash, fsPromises) {
+  if (!expectedHash) return;
+  if (!solutionPath) throw runnerError('缺少要校验的解答文件。', 'SOLUTION_ACCESS_FAILED');
+  const reader = getFsMethod(fsPromises, 'readFile');
+  let bytes;
+  try {
+    bytes = await reader(solutionPath);
+  } catch (error) {
+    throw runnerError('无法读取解答代码进行校验：' + (error?.message || '未知错误') + '。', 'SOLUTION_ACCESS_FAILED');
+  }
+  const actualHash = crypto.createHash('sha256').update(bytes).digest('hex');
+  if (actualHash !== expectedHash) {
+    throw runnerError('解答代码在运行前已发生变化。请再次运行。', 'SOLUTION_CHANGED');
+  }
 }
 
 async function assertExpectedScaffoldHash(scaffoldPath, expectedHash, fsPromises) {
@@ -615,7 +640,7 @@ async function assertExpectedScaffoldHash(scaffoldPath, expectedHash, fsPromises
   }
   const actualHash = crypto.createHash('sha256').update(bytes).digest('hex');
   if (actualHash !== expectedHash) {
-    throw runnerError('测试脚手架在确认后已发生变化。请审阅最新内容并再次运行。', 'SCAFFOLD_CHANGED');
+    throw runnerError('测试脚手架在运行前已发生变化。请再次运行。', 'SCAFFOLD_CHANGED');
   }
 }
 
@@ -933,6 +958,10 @@ function compilerFailure(plan, step, result) {
   );
 }
 
+function escapeRegularExpression(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 async function prepareBuildWorkspace(location, {
   solutionPath,
   fsPromises,
@@ -962,7 +991,18 @@ async function prepareBuildWorkspace(location, {
       readFile(source.filePath),
       readFile(location.scaffoldPath)
     ]);
-    let stagedSource = path.join(buildDirectory, RUNTIME_SOLUTION_BASENAME + extension);
+    const sourceFileName = path.basename(source.filePath);
+    if (/^(?:main|testcase)\.[^.]+$/i.test(sourceFileName)) {
+      throw runnerError(
+        '解答文件不能使用 main.<语言> 或 testcase.<语言> 这样的保留名称。请将其改回 solution.<语言>。',
+        'INVALID_SOURCE_NAME'
+      );
+    }
+    // Preserve an individually renamed solution's basename in the isolated
+    // build directory. Generated C/C++/Rust/Python scaffolds refer to the
+    // metadata-recorded relative filename, so staging every source under the
+    // literal solution.* name breaks those imports after a VS Code rename.
+    let stagedSource = path.join(buildDirectory, sourceFileName);
     const stagedScaffold = path.join(buildDirectory, RUNTIME_MAIN_BASENAME + extension);
     if (location.language === 'haskell') {
       const sourceText = Buffer.isBuffer(sourceBytes) ? sourceBytes.toString('utf8') : String(sourceBytes);
@@ -1020,9 +1060,12 @@ async function prepareBuildWorkspace(location, {
         && !/\bdeclare\s+(?:const|let|var)\s+process\b/.test(sourceText + '\n' + scaffoldText)
         ? 'declare const process: { argv: string[]; exitCode?: number; exit(code?: number): never };\n\n'
         : '';
-      const loadsSiblingSolution = /\brequire\s*\(\s*['"]\.\/solution(?:\.[a-z0-9]+)?['"]\s*\)/i.test(scaffoldText)
+      const sourceStem = path.basename(stagedSource, path.extname(stagedSource));
+      const siblingModule = escapeRegularExpression(`./${sourceStem}`)
+        + `(?:${escapeRegularExpression(path.extname(stagedSource))})?`;
+      const loadsSiblingSolution = new RegExp(`\\brequire\\s*\\(\\s*['"]${siblingModule}['"]\\s*\\)`, 'i').test(scaffoldText)
         || (location.language === 'typescript'
-          && /\b(?:from\s*|import\s*)['"]\.\/solution(?:\.[a-z0-9]+)?['"]/i.test(scaffoldText));
+          && new RegExp(`\\b(?:from\\s*|import\\s*)['"]${siblingModule}['"]`, 'i').test(scaffoldText));
       if (loadsSiblingSolution) {
         entryPath = stagedScaffold;
         if (typescriptPrelude) await writeFile(stagedScaffold, typescriptPrelude + scaffoldText, 'utf8');
@@ -1165,6 +1208,7 @@ async function runTestScaffold({
   maxOutputBytes,
   expectedCaseNames,
   expectedScaffoldHash,
+  expectedSolutionHash,
   spawnImpl = childProcess.spawn,
   platform,
   nodePath,
@@ -1174,10 +1218,12 @@ async function runTestScaffold({
   const selectedPlatform = platform || process.platform;
   const location = await resolveLocalScaffoldPath(problemFolder, scaffoldPath, { fsPromises });
   const expectedHash = validateExpectedScaffoldHash(expectedScaffoldHash);
-  // Confirmation happens in the extension host. Re-read the exact disk file
-  // immediately before any spawn so an external atomic replacement cannot
-  // cause the user to approve one scaffold and execute a different one.
+  const expectedSourceHash = validateExpectedSolutionHash(expectedSolutionHash);
+  // The extension host snapshots this file before dispatch. Re-read the exact
+  // disk bytes immediately before any spawn so an external atomic replacement
+  // cannot swap in different code between validation and execution.
   await assertExpectedScaffoldHash(location.scaffoldPath, expectedHash, fsPromises);
+  await assertExpectedSolutionHash(solutionPath, expectedSourceHash, fsPromises);
   const selectedTimeoutMs = boundedInteger(timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, '测试超时时间');
   const selectedCompileTimeoutMs = boundedInteger(
     compileTimeoutMs,
@@ -1272,6 +1318,10 @@ async function runTestScaffold({
           error.stderr = output.stderr;
           error.exitCode = output.exitCode;
           error.signal = output.signal;
+          // Keep already emitted case results and the original non-zero exit
+          // diagnostic available to the sidebar. The runner still rejects the
+          // protocol mismatch for callers that require an exact result set.
+          error.execution = output;
         }
         throw error;
       }

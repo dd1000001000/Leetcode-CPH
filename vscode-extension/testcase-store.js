@@ -142,6 +142,7 @@ function normalizeTestCases(values, options = {}) {
       const id = uniqueId(value.id, source, usedIds, options.idFactory);
       usedIds.add(id);
       const aiContentId = source === AI_SOURCE ? text(value.aiContentId) : '';
+      const hasPendingScaffold = source === MANUAL_SOURCE && typeof value.pendingScaffold === 'boolean';
       return {
         id,
         name,
@@ -149,7 +150,8 @@ function normalizeTestCases(values, options = {}) {
         expectedOutput: contentText(value.expectedOutput ?? value.output),
         source,
         createdAt: text(value.createdAt) || createdAt,
-        ...(aiContentId ? { aiContentId } : {})
+        ...(aiContentId ? { aiContentId } : {}),
+        ...(hasPendingScaffold ? { pendingScaffold: value.pendingScaffold } : {})
       };
     });
 }
@@ -393,6 +395,7 @@ async function createTestCase(problemFolder, draft = {}, options = {}) {
     // prior testcase has been deliberately deleted from both data and scaffold.
     name: nextTestcaseName(current),
     source: MANUAL_SOURCE,
+    pendingScaffold: true,
     createdAt: text(values.createdAt) || nowIso(options.now)
   }, { ...options, defaultSource: MANUAL_SOURCE });
   let id = testCase.id;
@@ -433,11 +436,16 @@ async function updateTestCase(problemFolder, id, draft = {}, options = {}) {
   const outputValue = Object.prototype.hasOwnProperty.call(draft, 'expectedOutput') ? draft.expectedOutput : draft.output;
   if (hasOutput && typeof outputValue !== 'string') throw new TypeError('测试用例预期输出必须是文本。');
 
+  const { pendingScaffold: wasPendingScaffold, ...currentWithoutPendingScaffold } = current;
+  const nextInput = hasInput ? contentText(draft.input) : current.input;
+  const nextExpectedOutput = hasOutput ? contentText(outputValue) : current.expectedOutput;
+  const keepPendingScaffold = wasPendingScaffold === true && nextInput === '' && nextExpectedOutput === '';
   const next = {
-    ...current,
-    input: hasInput ? contentText(draft.input) : current.input,
-    expectedOutput: hasOutput ? contentText(outputValue) : current.expectedOutput,
-    source: MANUAL_SOURCE
+    ...currentWithoutPendingScaffold,
+    input: nextInput,
+    expectedOutput: nextExpectedOutput,
+    source: MANUAL_SOURCE,
+    pendingScaffold: keepPendingScaffold
   };
   // An edited AI case is now user-owned.  Tombstone its original automatic
   // identities so an unchanged future extraction does not add a duplicate
